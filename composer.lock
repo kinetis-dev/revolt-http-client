@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "c0ab8ba3f5f187bd0ca59301dcdcc15b",
+    "content-hash": "d745ee4988b6d391fc56b3abb106397c",
     "packages": [
         {
             "name": "amphp/amp",
@@ -3118,19 +3118,17 @@
             "time": "2026-06-16T20:50:26+00:00"
         },
         {
-            "name": "kinetis/kinetis",
+            "name": "kinetis/framework",
             "version": "dev-main",
             "dist": {
                 "type": "path",
-                "url": "../kinetis",
-                "reference": "dcbbe485dd45f1c76e3a2fe9a6746eb4e822cac8"
+                "url": "../framework",
+                "reference": "c22a002f7f06f637bb92ba6488d78eb91cd1c33a"
             },
             "require": {
-                "nikic/php-parser": "^5.0",
                 "nyholm/psr7": "^1.8",
                 "nyholm/psr7-server": "^1.1",
                 "php": "^8.4",
-                "phpstan/phpstan": "^2.2",
                 "psr/container": "^2.0",
                 "psr/event-dispatcher": "^1.0",
                 "psr/http-message": "^2.0",
@@ -3142,6 +3140,8 @@
             },
             "require-dev": {
                 "infection/infection": "^0.34.2",
+                "nikic/php-parser": "^5.0",
+                "phpstan/phpstan": "^2.2",
                 "phpunit/phpunit": "^11.0",
                 "vimeo/psalm": "^6.16"
             },
@@ -7639,7 +7639,7 @@
     "aliases": [],
     "minimum-stability": "stable",
     "stability-flags": {
-        "kinetis/kinetis": 20
+        "kinetis/framework": 20
     },
     "prefer-stable": true,
     "prefer-lowest": false,

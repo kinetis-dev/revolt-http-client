@@ -13,7 +13,7 @@
 Built for Kinetis, but usable in
 any PHP project — this package depends on nothing beyond
 `symfony/http-client` (and its `symfony/http-client-contracts`) and
-`amphp/http-client`. No `kinetis/kinetis` required.
+`amphp/http-client`. No `kinetis/framework` required.
 
 ```php
 use Kinetis\RevoltHttpClient\AmpHttpClientFactory;
