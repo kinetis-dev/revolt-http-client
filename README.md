@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/v/kinetis/revolt-http-client" alt="Packagist Version"></a>
+  <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/v/kinetis/revolt-http-client?label=version" alt="Packagist Version"></a>
   <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/dt/kinetis/revolt-http-client" alt="Packagist Downloads"></a>
   <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/php-v/kinetis/revolt-http-client" alt="PHP Version"></a>
   <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/l/kinetis/revolt-http-client" alt="License"></a>
