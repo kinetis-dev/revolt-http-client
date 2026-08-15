@@ -8,6 +8,14 @@
   <strong>A Revolt-native, Fiber-suspending implementation of Symfony's <code>HttpClientInterface</code></strong>
 </p>
 
+<p align="center">
+  <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/v/kinetis/revolt-http-client" alt="Packagist Version"></a>
+  <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/dt/kinetis/revolt-http-client" alt="Packagist Downloads"></a>
+  <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/php-v/kinetis/revolt-http-client" alt="PHP Version"></a>
+  <a href="https://packagist.org/packages/kinetis/revolt-http-client"><img src="https://img.shields.io/packagist/l/kinetis/revolt-http-client" alt="License"></a>
+  <a href="https://github.com/kinetis-dev/kinetis/actions/workflows/ci.yml"><img src="https://github.com/kinetis-dev/kinetis/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
+
 ---
 
 Built for Kinetis, but usable in
