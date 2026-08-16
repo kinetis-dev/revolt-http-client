@@ -16,7 +16,7 @@
     },
     "require-dev": {
         "infection/infection": "^0.34.2",
-        "kinetis/framework": "dev-main",
+        "kinetis/framework": "^1.8",
         "phpstan/phpstan": "^2.2",
         "phpunit/phpunit": "^11.0",
         "vimeo/psalm": "^6.16"
@@ -34,12 +34,6 @@
     "extra": {
         "kinetis": {}
     },
-    "repositories": [
-        {
-            "type": "path",
-            "url": "../framework"
-        }
-    ],
     "config": {
         "sort-packages": true,
         "allow-plugins": {
