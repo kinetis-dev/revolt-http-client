@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "d745ee4988b6d391fc56b3abb106397c",
+    "content-hash": "6b3975a0927b763b8edc983b19a269c6",
     "packages": [
         {
             "name": "amphp/amp",
@@ -3123,9 +3123,10 @@
             "dist": {
                 "type": "path",
                 "url": "../framework",
-                "reference": "c22a002f7f06f637bb92ba6488d78eb91cd1c33a"
+                "reference": "0de7f8938cf33a41a31bb8d347a7a95cfe8fd535"
             },
             "require": {
+                "ext-fileinfo": "*",
                 "nyholm/psr7": "^1.8",
                 "nyholm/psr7-server": "^1.1",
                 "php": "^8.4",
@@ -3145,10 +3146,16 @@
                 "phpunit/phpunit": "^11.0",
                 "vimeo/psalm": "^6.16"
             },
+            "suggest": {
+                "ext-event": "An OS-native Revolt event-loop backend (epoll), removing select()'s 1024 fd-number ceiling. Needed when the loop watches real sockets (native Postgres driver, Redis, HTTP client) in a FrankenPHP worker process; a MySQL-only deployment does not need it. ext-uv/ext-ev work equally."
+            },
             "bin": [
                 "bin/kinetis"
             ],
             "type": "library",
+            "extra": {
+                "kinetis": []
+            },
             "autoload": {
                 "psr-4": {
                     "Kinetis\\": "src/"
