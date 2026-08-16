@@ -5,6 +5,10 @@
             "src"
         ]
     },
+    // The suite drives a real HTTP server, so a mutant run costs far
+    // more than the 10s default allows — every mutant reported as
+    // "timed out" rather than killed, scoring 0%.
+    "timeout": 60,
     "mutators": {
         "@default": true
     }

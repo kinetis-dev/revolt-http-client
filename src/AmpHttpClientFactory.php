@@ -9,8 +9,7 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 /**
  * Produces a Symfony HttpClientInterface backed by amphp/http-client — the
- * current, genuinely Revolt-based generation, not the pre-Fiber one
- * Symfony's own AmpHttpClient targeted through Symfony 7.x. A request made
+ * current, genuinely Revolt-based generation. A request made
  * through the returned client suspends the calling Fiber rather than
  * blocking the process, composing with any other Revolt-native code
  * (Kinetis\Persistence's MySQL/Postgres/Redis clients, Kinetis\Storage's

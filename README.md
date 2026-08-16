@@ -24,16 +24,34 @@ any PHP project — this package depends on nothing beyond
 `amphp/http-client`. No `kinetis/framework` required.
 
 ```php
-use Kinetis\RevoltHttpClient\AmpHttpClientFactory;
+use Kinetis\RevoltHttpClient\Http;
 
-$client = AmpHttpClientFactory::create();
-$response = $client->request('GET', 'https://example.com/');
-$response->getContent();
+$http = new Http()->withBaseUrl('https://api.example.com')->withToken($key);
+
+$orders = $http->get('/orders', ['status' => 'open'])->throw()->json();
+$http->post('/orders', ['sku' => 'A1', 'quantity' => 2]);
 ```
 
 A request made through this client suspends the calling Fiber and yields
 back to Revolt's event loop while waiting on the network, instead of
-blocking the whole process.
+blocking the whole process — so several run at once through
+`Kinetis\Async\concurrently()` with no pooling API of its own.
+
+An error status is returned rather than thrown: `successful()`,
+`failed()`, `clientError()`, and `serverError()` are answers to branch
+on, and `throw()` opts into raising instead. Read the body with
+`json()`, `jsonPath('customer.email')`, or `body()`.
+
+`AmpHttpClientFactory::create()` returns the underlying Symfony
+`HttpClientInterface` on its own, for libraries that want to be handed a
+client:
+
+```php
+use Kinetis\RevoltHttpClient\AmpHttpClientFactory;
+
+$client = AmpHttpClientFactory::create();
+$response = $client->request('GET', 'https://example.com/');
+```
 
 ## Using it with AsyncAws
 
