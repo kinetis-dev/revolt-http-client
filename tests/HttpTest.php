@@ -19,11 +19,10 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
  * client claims to send is asserted from the server's own view of the
  * request, not from the client's internal state.
  *
- * Each request costs about a second here, which is the fixture rather
- * than the client — `php -S` serves one connection at a time, and the
- * sibling AmpHttpClientFactoryTest pays the same for its single request.
- * Against a server that keeps a connection open, successive requests
- * measure 1-3ms.
+ * Requests here run from plain top-level code — the same path a PHP-FPM
+ * consumer without concurrently() takes — so this suite also pins that
+ * HttpResponse's event-loop await keeps that path fast rather than
+ * falling into Symfony's one-second transport poll tick.
  */
 final class HttpTest extends TestCase
 {

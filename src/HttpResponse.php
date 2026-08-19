@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace Kinetis\RevoltHttpClient;
 
+use Closure;
 use JsonException;
 use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
+use Revolt\EventLoop;
+use Throwable;
 use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
 
@@ -46,7 +49,7 @@ final class HttpResponse
     public function status(): int
     {
         try {
-            return $this->response->getStatusCode();
+            return self::await($this->response->getStatusCode(...));
         } catch (TransportExceptionInterface $e) {
             throw HttpRequestException::transportFailure($this->method, $this->effectiveUrl(), $e);
         }
@@ -84,7 +87,7 @@ final class HttpResponse
         try {
             // getContent(false) suppresses Symfony's own
             // throw-on-error-status, leaving that decision here.
-            return $this->body ??= $this->response->getContent(false);
+            return $this->body ??= self::await(fn (): string => $this->response->getContent(false));
         } catch (TransportExceptionInterface $e) {
             throw HttpRequestException::transportFailure($this->method, $this->effectiveUrl(), $e);
         }
@@ -138,7 +141,7 @@ final class HttpResponse
     public function headers(): array
     {
         try {
-            return $this->response->getHeaders(false);
+            return self::await(fn (): array => $this->response->getHeaders(false));
         } catch (TransportExceptionInterface $e) {
             throw HttpRequestException::transportFailure($this->method, $this->effectiveUrl(), $e);
         }
@@ -176,5 +179,49 @@ final class HttpResponse
     public function toSymfonyResponse(): ResponseInterface
     {
         return $this->response;
+    }
+    /**
+     * Runs a blocking read inside an event-loop-managed fiber and waits
+     * for it on a Revolt suspension.
+     *
+     * Called from plain top-level code, Symfony's response-stream loop
+     * only polls for transport activity once a second — the Amp bridge
+     * fails to wake it when a chunk is already in, so every read from
+     * outside a fiber pays that full poll tick. Inside a fiber the event
+     * loop keeps turning and the same read completes in a couple of
+     * milliseconds; this hands every caller that path. Resuming before
+     * the suspend is reached is fine — a Revolt suspension stores the
+     * result either way.
+     *
+     * @template T
+     * @param Closure(): T $read
+     * @return T
+     */
+    private static function await(Closure $read): mixed
+    {
+        $suspension = EventLoop::getSuspension();
+        $result = null;
+        $error = null;
+
+        EventLoop::queue(static function () use ($read, $suspension, &$result, &$error): void {
+            try {
+                $result = $read();
+            } catch (Throwable $e) {
+                $error = $e;
+            }
+
+            $suspension->resume();
+        });
+
+        $suspension->suspend();
+
+        if ($error !== null) {
+            throw $error;
+        }
+
+        // The queued fiber ran to completion before the suspension
+        // resumed, so exactly one of $error/$result is set by now.
+        /** @var T $result */
+        return $result;
     }
 }
