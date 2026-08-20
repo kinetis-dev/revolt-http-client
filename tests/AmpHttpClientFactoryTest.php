@@ -26,16 +26,41 @@ final class AmpHttpClientFactoryTest extends TestCase
             $pipes,
         );
 
-        // No fixed readiness signal from `php -S` other than "give it a
-        // moment" — the same discipline the queue package's own real-server
-        // verification scripts already use.
-        usleep(300_000);
+        self::waitForServerReady(self::HOST);
     }
 
     public static function tearDownAfterClass(): void
     {
         proc_terminate(self::$serverProcess);
         proc_close(self::$serverProcess);
+    }
+
+    /**
+     * `php -S` gives no fixed readiness signal of its own — a real TCP
+     * connect attempt, polled with a bounded deadline, in place of a
+     * fixed sleep that can race the server's own startup and lose on a
+     * slower or more loaded runner (this exact pattern, in a sibling
+     * fixture, caused a real failure under SonarQube Cloud's
+     * PCOV-instrumented coverage run — a genuine connection failure
+     * against a server that hadn't started listening yet).
+     */
+    private static function waitForServerReady(string $host): void
+    {
+        $deadline = microtime(true) + 5.0;
+
+        while (microtime(true) < $deadline) {
+            $socket = @stream_socket_client("tcp://{$host}", timeout: 0.1);
+
+            if ($socket !== false) {
+                fclose($socket);
+
+                return;
+            }
+
+            usleep(20_000);
+        }
+
+        self::fail("The fixture server at {$host} never started accepting connections.");
     }
 
     public function test_create_returns_an_amp_http_client_instance(): void
