@@ -77,7 +77,7 @@ composer require kinetis/revolt-http-client
 
 Requires PHP 8.4+ (the floor `symfony/http-client:^8.0` itself requires).
 Full documentation:
-[docs.kinetis.dev/revolt-http-client.html](https://docs.kinetis.dev/revolt-http-client.html).
+[kinetis.dev/docs/revolt-http-client.html](https://kinetis.dev/docs/revolt-http-client.html).
 
 ## License
 
