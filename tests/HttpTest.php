@@ -182,15 +182,94 @@ final class HttpTest extends TestCase
     public function test_throw_raises_on_an_error_status_and_names_the_request(): void
     {
         $this->expectException(HttpRequestException::class);
-        // The whole message in one assertion — expectExceptionMessage()
-        // replaces rather than accumulates, so a second call would
-        // silently discard the first. The body belongs in the message
-        // because it explains the status.
-        $this->expectExceptionMessage(
-            'GET http://127.0.0.1:8099/status/500 returned HTTP 500. Response: {"error":"deliberate failure"}',
-        );
+        // getMessage() deliberately excludes the response body — see
+        // test_the_full_diagnostic_detail_is_reachable_but_not_in_getMessage()
+        // for where that detail actually lives.
+        $this->expectExceptionMessage('GET http://127.0.0.1:8099/status/500 returned HTTP 500.');
 
         $this->http()->get('/status/500')->throw();
+    }
+
+    public function test_the_full_diagnostic_detail_is_reachable_but_not_in_getmessage(): void
+    {
+        try {
+            $this->http()->get('/status/500')->throw();
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            self::assertStringNotContainsString('deliberate failure', $e->getMessage());
+            self::assertSame('http://127.0.0.1:8099/status/500', $e->diagnosticUrl());
+            self::assertSame('{"error":"deliberate failure"}', $e->diagnosticBody());
+            self::assertStringContainsString('deliberate failure', $e->diagnosticMessage());
+        }
+    }
+
+    public function test_getmessage_strips_userinfo_and_the_query_string_but_diagnostic_url_keeps_them(): void
+    {
+        $http = new Http(new MockHttpClient(
+            static fn (): MockResponse => new MockResponse('nope', ['http_code' => 403]),
+        ));
+
+        try {
+            $http->get('https://user:secret@api.example.com/orders?signature=abc123')->throw();
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            self::assertStringNotContainsString('secret', $e->getMessage());
+            self::assertStringNotContainsString('signature=abc123', $e->getMessage());
+            self::assertSame('GET https://api.example.com/orders returned HTTP 403.', $e->getMessage());
+            self::assertSame('https://user:secret@api.example.com/orders?signature=abc123', $e->diagnosticUrl());
+        }
+    }
+
+    /**
+     * diagnosticUrl()/diagnosticBody() are private-backed accessor
+     * methods, not public properties — json_encode() (or any other
+     * implicit reflection over an object's public state, the way a
+     * generic structured-logging pipeline commonly serializes a caught
+     * exception) must never expose the raw URL or response body unless
+     * something explicitly calls those methods.
+     */
+    public function test_json_encoding_the_exception_never_exposes_the_raw_url_or_body(): void
+    {
+        $http = new Http(new MockHttpClient(
+            static fn (): MockResponse => new MockResponse('{"secret":"BODYSECRET"}', ['http_code' => 500]),
+        ));
+
+        try {
+            $http->get('https://user:pass@example.test/orders?token=TOPSECRET')->throw();
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            $encoded = json_encode($e, JSON_THROW_ON_ERROR);
+
+            self::assertStringNotContainsString('TOPSECRET', $encoded);
+            self::assertStringNotContainsString('pass', $encoded);
+            self::assertStringNotContainsString('BODYSECRET', $encoded);
+            self::assertSame('{"status":500}', $encoded);
+        }
+    }
+
+    /**
+     * A real transport exception commonly names the URL it failed to
+     * reach, userinfo and all — copying $previous->getMessage() verbatim
+     * into this class's own message (the pre-fix behavior) would leak
+     * exactly the secret getMessage() elsewhere in this file is proven to
+     * redact. The full original message is still reachable, deliberately,
+     * via getPrevious().
+     */
+    public function test_a_transport_failures_own_message_never_leaks_into_getmessage(): void
+    {
+        $http = new Http(new MockHttpClient(static fn (): MockResponse => new MockResponse('', [
+            'error' => 'connect failed for https://user:pass@example.test/orders?token=TOPSECRET',
+        ])));
+
+        try {
+            $http->get('https://example.test/orders')->body();
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            self::assertStringNotContainsString('TOPSECRET', $e->getMessage());
+            self::assertStringNotContainsString('pass', $e->getMessage());
+            self::assertNotNull($e->getPrevious());
+            self::assertStringContainsString('TOPSECRET', $e->getPrevious()->getMessage());
+        }
     }
 
     public function test_throw_returns_the_response_when_successful(): void
