@@ -337,7 +337,7 @@ final class Http
      */
     private static function normalizeHeaderArray(array $headers): array
     {
-        /** @var array<string, list<array{kind: 'associative'|'numeric', name: string, values: list<string>}>> $occurrences */
+        /** @var array<string, list<array{kind: 'associative'|'numeric', name: string, values: array<string>}>> $occurrences */
         $occurrences = [];
 
         foreach ($headers as $key => $value) {
@@ -379,6 +379,15 @@ final class Http
             ];
         }
 
+        return self::resolveHeaderOccurrences($occurrences);
+    }
+
+    /**
+     * @param array<string, list<array{kind: 'associative'|'numeric', name: string, values: array<string>}>> $occurrences
+     * @return array<string, array{name: string, values: list<string>}>
+     */
+    private static function resolveHeaderOccurrences(array $occurrences): array
+    {
         $resolved = [];
 
         foreach ($occurrences as $lowercaseName => $entries) {
