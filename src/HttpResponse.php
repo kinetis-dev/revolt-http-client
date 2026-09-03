@@ -94,17 +94,35 @@ final class HttpResponse
     }
 
     /**
-     * The decoded JSON body as an array.
+     * The decoded JSON body as an array — a JSON object or array, per
+     * this method's own return type. A body that fails to parse as JSON
+     * at all throws via notJson(); a body that parses successfully but
+     * whose top-level value is a bare JSON string, number, boolean, or
+     * null (all syntactically valid JSON, just not something this
+     * method's array-oriented contract can return) throws via
+     * unexpectedJsonType() instead — never the native TypeError a bare
+     * `return $decoded;` would otherwise raise for a non-array value.
      *
      * @return array<array-key, mixed>
      */
     public function json(): array
     {
+        $body = $this->body();
+
         try {
-            /** @var array<array-key, mixed> $decoded */
-            $decoded = json_decode($this->body(), associative: true, flags: JSON_THROW_ON_ERROR);
+            $decoded = json_decode($body, associative: true, flags: JSON_THROW_ON_ERROR);
         } catch (JsonException $e) {
             throw HttpRequestException::notJson($this->method, $this->effectiveUrl(), $this->status(), $e);
+        }
+
+        if (!is_array($decoded)) {
+            throw HttpRequestException::unexpectedJsonType(
+                $this->method,
+                $this->effectiveUrl(),
+                $this->status(),
+                $body,
+                get_debug_type($decoded),
+            );
         }
 
         return $decoded;

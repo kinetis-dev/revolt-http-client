@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kinetis\RevoltHttpClient;
 
+use InvalidArgumentException;
 use Symfony\Component\HttpClient\RetryableHttpClient;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 
@@ -69,14 +70,21 @@ final class Http
     }
 
     /**
+     * A later call overrides an earlier one for the same header name,
+     * matching HTTP's own case-insensitive field-name semantics — a
+     * second `withHeaders(['authorization' => ...])` replaces an earlier
+     * `withHeaders(['Authorization' => ...])` entirely, not alongside it.
+     * See {@see mergeHeaders()} for how that's guaranteed rather than
+     * left to depend on Symfony's own internal header normalization.
+     *
      * @param array<string, string> $headers
      */
     public function withHeaders(array $headers): self
     {
-        /** @var array<string, string> $existing */
+        /** @var array<array-key, mixed> $existing */
         $existing = $this->options['headers'] ?? [];
 
-        return $this->withOptions(['headers' => [...$existing, ...$headers]]);
+        return $this->withOptions(['headers' => self::mergeHeaders($existing, $headers)]);
     }
 
     public function withToken(string $token, string $scheme = 'Bearer'): self
@@ -205,7 +213,9 @@ final class Http
     /**
      * Merges per-call options over the client's, with headers and query
      * combined key-wise rather than replaced — a call adding one header
-     * keeps the client's Authorization.
+     * keeps the client's Authorization. Headers merge case-insensitively
+     * by name (see {@see mergeHeaders()}); query keys are ordinary,
+     * case-sensitive PHP array keys, so a plain spread is correct there.
      *
      * @param array<string, mixed> $options
      * @return array<string, mixed>
@@ -214,18 +224,194 @@ final class Http
     {
         $merged = [...$this->options, ...$options];
 
-        foreach (['headers', 'query'] as $key) {
-            /** @var array<string, mixed> $mine */
-            $mine = $this->options[$key] ?? [];
-            /** @var array<string, mixed> $theirs */
-            $theirs = $options[$key] ?? [];
+        /** @var array<array-key, mixed> $myHeaders */
+        $myHeaders = $this->options['headers'] ?? [];
+        /** @var array<array-key, mixed> $theirHeaders */
+        $theirHeaders = $options['headers'] ?? [];
 
-            if ($mine !== [] || $theirs !== []) {
-                $merged[$key] = [...$mine, ...$theirs];
-            }
+        if ($myHeaders !== [] || $theirHeaders !== []) {
+            $merged['headers'] = self::mergeHeaders($myHeaders, $theirHeaders);
+        }
+
+        /** @var array<string, mixed> $myQuery */
+        $myQuery = $this->options['query'] ?? [];
+        /** @var array<string, mixed> $theirQuery */
+        $theirQuery = $options['query'] ?? [];
+
+        if ($myQuery !== [] || $theirQuery !== []) {
+            $merged['query'] = [...$myQuery, ...$theirQuery];
         }
 
         return $merged;
+    }
+
+    /**
+     * Merges two Symfony HttpClient-shaped header arrays, case-
+     * insensitively by header name, with $theirs winning entirely over
+     * $mine for any name both define — the same "later/more specific
+     * wins" precedence this class already documents for option merging
+     * generally.
+     *
+     * Each side is first resolved independently, via
+     * {@see normalizeHeaderArray()}, into exactly one entry per logical
+     * header name — collapsing any same-name collision *within* that one
+     * side before the two sides are ever compared. This is deliberate,
+     * not incidental: reassembling a winning name's *raw* multiple
+     * occurrences (several numeric "Name: value" lines, or several
+     * differently-cased associative keys) back into the Symfony options
+     * array would leave Symfony's own `normalizeHeaders()` to resolve
+     * them — and it resolves multiple *separate* top-level array entries
+     * for the same name by unconditionally resetting on each one, an
+     * undocumented internal collapse, not a rule this class controls or
+     * should depend on for its own documented precedence. Normalizing
+     * first means the merged result Symfony ever sees contains at most
+     * one array entry per header name, so there is nothing left for its
+     * own normalization to have to resolve.
+     *
+     * @param array<array-key, mixed> $mine
+     * @param array<array-key, mixed> $theirs
+     * @return array<string, string|list<string>>
+     */
+    private static function mergeHeaders(array $mine, array $theirs): array
+    {
+        $mineResolved = self::normalizeHeaderArray($mine);
+        $theirsResolved = self::normalizeHeaderArray($theirs);
+
+        // Array union (+) keeps the LEFT operand's value for any key
+        // present in both — putting $theirsResolved first is what makes
+        // it win over $mineResolved for a shared (lowercase) name.
+        $winning = $theirsResolved + $mineResolved;
+
+        $result = [];
+
+        foreach ($winning as ['name' => $name, 'values' => $values]) {
+            $result[$name] = count($values) === 1 ? $values[0] : $values;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Resolves one header array — which may freely mix Symfony's own two
+     * accepted forms, associative (`'Name' => 'value'` or `'Name' =>
+     * ['v1', 'v2']`) and numerically-indexed raw `"Name: value"` lines —
+     * into exactly one entry per lowercase header name:
+     * `['name' => <winning casing>, 'values' => <ordered value list>]`.
+     *
+     * Multiple *numeric-line* occurrences of the same name are a
+     * deliberately repeated header (there is no other reason to write
+     * the same name twice in raw-line form) and are combined into one
+     * ordered multi-value list, using the *last* occurrence's own
+     * casing as the winning spelling — consistent with every other
+     * "later wins" precedence in this class, applied here for the one
+     * remaining choice that needs to be made (which casing labels the
+     * combined list).
+     *
+     * Multiple *associative* occurrences of the same name (two different
+     * PHP keys — differently cased spellings of one HTTP field) are a
+     * same-array casing collision, not a repeat: the *last* occurrence
+     * wins outright, its own value(s) kept and every earlier occurrence
+     * for that name dropped — never combined, since re-interpreting
+     * several distinct associative entries as one intentional
+     * multi-value list would be assuming something the input never
+     * actually said.
+     *
+     * A name given via *both* forms within the same array — one
+     * associative entry and one raw line for what's nominally the same
+     * header — has no principled single resolution (which form's value
+     * should anchor the combined list?) and is rejected outright with a
+     * clear exception instead of guessing.
+     *
+     * A raw numeric-line entry's name is read the same way Symfony's own
+     * normalizeHeaders() reads it — explode() capped at the first colon
+     * only — so a value containing its own embedded colon (a URL, for
+     * instance) is never mistaken for part of the name. An entry that
+     * can't be understood as a header at all (a numeric key whose value
+     * isn't a "Name: value" string, or whose name portion is empty or
+     * all whitespace, e.g. ": value") is rejected here, clearly, rather
+     * than passed through to fail later with a vaguer error from
+     * Symfony's own normalization or a silent wrong split.
+     *
+     * @param array<array-key, mixed> $headers
+     * @return array<string, array{name: string, values: list<string>}>
+     */
+    private static function normalizeHeaderArray(array $headers): array
+    {
+        /** @var array<string, list<array{kind: 'associative'|'numeric', name: string, values: list<string>}>> $occurrences */
+        $occurrences = [];
+
+        foreach ($headers as $key => $value) {
+            if (is_int($key)) {
+                if (!is_string($value) || !str_contains($value, ':')) {
+                    throw new InvalidArgumentException(sprintf(
+                        'A numeric header entry must be a "Name: value" string; got %s.',
+                        get_debug_type($value),
+                    ));
+                }
+
+                [$name, $rest] = explode(':', $value, 2);
+                $name = trim($name);
+
+                if ($name === '') {
+                    throw new InvalidArgumentException(
+                        'A numeric header entry must not have an empty header name (e.g. ": value").',
+                    );
+                }
+
+                $occurrences[strtolower($name)][] = [
+                    'kind' => 'numeric',
+                    'name' => $name,
+                    'values' => [ltrim($rest)],
+                ];
+
+                continue;
+            }
+
+            /** @var mixed $value */
+            $values = is_iterable($value)
+                ? array_map(static fn (mixed $v): string => (string) $v, [...$value])
+                : [(string) $value];
+
+            $occurrences[strtolower($key)][] = [
+                'kind' => 'associative',
+                'name' => $key,
+                'values' => $values,
+            ];
+        }
+
+        $resolved = [];
+
+        foreach ($occurrences as $lowercaseName => $entries) {
+            $kinds = array_unique(array_column($entries, 'kind'));
+
+            if (count($kinds) > 1) {
+                throw new InvalidArgumentException(sprintf(
+                    'Header "%s" is given in both associative and raw "Name: value" line form within '
+                        . 'the same array — use only one form for a given header name.',
+                    $lowercaseName,
+                ));
+            }
+
+            if ($kinds === ['numeric']) {
+                $values = [];
+
+                foreach ($entries as $entry) {
+                    array_push($values, ...$entry['values']);
+                }
+
+                $resolved[$lowercaseName] = ['name' => $entries[count($entries) - 1]['name'], 'values' => $values];
+
+                continue;
+            }
+
+            // Associative: the last occurrence wins outright, its own
+            // value(s) kept as-is; every earlier occurrence for this
+            // name is dropped, never combined with it.
+            $winner = $entries[count($entries) - 1];
+            $resolved[$lowercaseName] = ['name' => $winner['name'], 'values' => array_values($winner['values'])];
+        }
+
+        return $resolved;
     }
 
     /**

@@ -8,6 +8,8 @@ use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
 use Kinetis\RevoltHttpClient\AmpHttpClientFactory;
 use Kinetis\RevoltHttpClient\Http;
 use Fiber;
+use InvalidArgumentException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 use Symfony\Component\HttpClient\MockHttpClient;
@@ -152,6 +154,211 @@ final class HttpTest extends TestCase
         self::assertSame('abc', $response->jsonPath('headers.x-request-id'));
     }
 
+    /**
+     * @return iterable<string, array{configured: string, perCall: string}>
+     */
+    public static function differentlyCasedHeaderNameProvider(): iterable
+    {
+        yield 'lowercase configured, uppercase per-call' => ['configured' => 'authorization', 'perCall' => 'Authorization'];
+        yield 'uppercase configured, lowercase per-call' => ['configured' => 'Authorization', 'perCall' => 'authorization'];
+    }
+
+    /**
+     * HTTP field names are case-insensitive — a per-call header must
+     * override a configured one for the same name regardless of which
+     * casing either side used, so only one value ever reaches the
+     * server, never both as ambiguous duplicates.
+     */
+    #[DataProvider('differentlyCasedHeaderNameProvider')]
+    public function test_a_per_call_header_overrides_a_configured_one_regardless_of_casing(
+        string $configured,
+        string $perCall,
+    ): void {
+        $response = $this->http()
+            ->withHeaders([$configured => 'configured-value'])
+            ->send('GET', '/me', ['headers' => [$perCall => 'per-call-value']]);
+
+        self::assertSame('per-call-value', $response->jsonPath('headers.authorization'));
+    }
+
+    /**
+     * The original, identical-casing override behavior this fix must
+     * not disturb.
+     */
+    public function test_a_per_call_header_overrides_a_configured_one_of_the_same_case(): void
+    {
+        $response = $this->http()
+            ->withHeaders(['Authorization' => 'configured-value'])
+            ->send('GET', '/me', ['headers' => ['Authorization' => 'per-call-value']]);
+
+        self::assertSame('per-call-value', $response->jsonPath('headers.authorization'));
+    }
+
+    /**
+     * A second withHeaders() call overrides the first for the same
+     * header name, case-insensitively — chained client-level
+     * configuration, not just a per-call override.
+     */
+    public function test_a_later_with_headers_call_overrides_an_earlier_one_regardless_of_casing(): void
+    {
+        $response = $this->http()
+            ->withHeaders(['X-Tenant' => 'first'])
+            ->withHeaders(['x-tenant' => 'second'])
+            ->get('/me');
+
+        self::assertSame('second', $response->jsonPath('headers.x-tenant'));
+    }
+
+    /**
+     * Overriding one header name must never disturb an unrelated one —
+     * genuinely different names simply accumulate.
+     */
+    public function test_unrelated_headers_accumulate_across_configured_and_per_call(): void
+    {
+        $response = $this->http()
+            ->withHeaders(['X-Tenant' => 'acme'])
+            ->send('GET', '/me', ['headers' => ['X-Request-Id' => 'abc']]);
+
+        self::assertSame('acme', $response->jsonPath('headers.x-tenant'));
+        self::assertSame('abc', $response->jsonPath('headers.x-request-id'));
+    }
+
+    /**
+     * A header intentionally given several values for the same name
+     * (Symfony's own accepted `'Name' => ['v1', 'v2']` form) must send
+     * every value, not be collapsed to one by the case-insensitive
+     * merge — the merge only collapses *different* PHP array keys that
+     * name the *same* HTTP field case-insensitively, never a
+     * deliberately repeated single header. PHP's own SAPI joins
+     * genuinely repeated incoming header lines with ", " (RFC 7230
+     * §3.2.2), so the comma-joined value reaching the server is exactly
+     * what proves both lines were actually sent, not just one.
+     */
+    public function test_repeated_intentional_header_values_all_survive(): void
+    {
+        $response = $this->http()->send('GET', '/me', ['headers' => ['X-Custom' => ['first', 'second']]]);
+
+        self::assertSame('first, second', $response->jsonPath('headers.x-custom'));
+    }
+
+    /**
+     * `send()` accepts raw Symfony options, including the numerically-
+     * indexed "Name: value" line form for headers — a per-call override
+     * given this way must still deterministically win over a configured
+     * header given the ordinary associative form, for the same name.
+     */
+    public function test_a_numeric_line_per_call_header_overrides_a_configured_associative_one(): void
+    {
+        $response = $this->http()
+            ->withHeaders(['Authorization' => 'configured-value'])
+            ->send('GET', '/me', ['headers' => [0 => 'Authorization: per-call-value']]);
+
+        self::assertSame('per-call-value', $response->jsonPath('headers.authorization'));
+    }
+
+    /**
+     * The header name is read up to only the *first* colon in a raw
+     * "Name: value" line, matching Symfony's own normalizeHeaders() —
+     * a value that itself contains a colon (a URL, here) must not be
+     * misread as part of the header name and must reach the server
+     * intact.
+     */
+    public function test_a_numeric_line_headers_value_may_contain_its_own_colon(): void
+    {
+        $response = $this->http()->send('GET', '/me', ['headers' => [0 => 'X-Custom: http://example.com']]);
+
+        self::assertSame('http://example.com', $response->jsonPath('headers.x-custom'));
+    }
+
+    /**
+     * A numeric header entry that isn't a real "Name: value" string
+     * can't be merged safely — rejected clearly here, rather than
+     * silently producing a wrong split or a vaguer failure from
+     * Symfony's own normalization further down the line.
+     */
+    public function test_a_malformed_numeric_header_entry_is_rejected_clearly(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('A numeric header entry must be a "Name: value" string');
+
+        $this->http()->send('GET', '/me', ['headers' => [0 => 'NoColonHere']]);
+    }
+
+    /**
+     * Two *separate* numeric "Name: value" lines for the same header
+     * name, within one array, is how a deliberate repeat is expressed
+     * in raw-line form — both values must reach the server, not just
+     * whichever one Symfony's own per-entry-reset normalization would
+     * otherwise have kept. Confirmed via the real reflect-server rather
+     * than the merged array's own shape, so this actually proves the
+     * value on the wire, not just an intermediate representation.
+     */
+    public function test_two_numeric_lines_for_the_same_name_both_reach_the_server(): void
+    {
+        $response = $this->http()->send('GET', '/me', [
+            'headers' => [0 => 'X-Custom: first', 1 => 'X-Custom: second'],
+        ]);
+
+        self::assertSame('first, second', $response->jsonPath('headers.x-custom'));
+    }
+
+    /**
+     * Two *associative* case-variant keys for the same header name,
+     * within one array, is a same-array casing collision, not a
+     * deliberate repeat — the last occurrence must win outright, with
+     * only its own value reaching the server.
+     */
+    public function test_same_array_associative_case_variants_resolve_to_only_the_last_one(): void
+    {
+        $response = $this->http()->send('GET', '/me', [
+            'headers' => ['Authorization' => 'first', 'authorization' => 'second'],
+        ]);
+
+        self::assertSame('second', $response->jsonPath('headers.authorization'));
+    }
+
+    /**
+     * A header name given via *both* the associative and raw-line form
+     * within one array has no single principled resolution — rejected
+     * outright rather than arbitrarily preferring one form over the
+     * other.
+     */
+    public function test_mixing_associative_and_numeric_line_forms_for_the_same_name_is_rejected(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(
+            'Header "authorization" is given in both associative and raw "Name: value" line form',
+        );
+
+        $this->http()->send('GET', '/me', [
+            'headers' => ['Authorization' => 'assoc-value', 0 => 'authorization: raw-value'],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, list<string>>
+     */
+    public static function emptyNumericHeaderNameProvider(): iterable
+    {
+        yield 'no name before the colon' => [': value'];
+        yield 'whitespace-only name before the colon' => ['   : value'];
+    }
+
+    /**
+     * A numeric line with nothing (or only whitespace) before the colon
+     * has no real header name — the colon-only check alone would accept
+     * this, so the name portion is validated separately after
+     * extraction.
+     */
+    #[DataProvider('emptyNumericHeaderNameProvider')]
+    public function test_a_numeric_header_entry_with_an_empty_name_is_rejected_clearly(string $line): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('must not have an empty header name');
+
+        $this->http()->send('GET', '/me', ['headers' => [0 => $line]]);
+    }
+
     public function test_with_query_merges_into_every_request(): void
     {
         $response = $this->http()->withQuery(['api_version' => '2'])->get('/orders', ['page' => '1']);
@@ -294,6 +501,120 @@ final class HttpTest extends TestCase
         $this->expectException(HttpRequestException::class);
         $this->expectExceptionMessage('is not valid JSON');
         $response->json();
+    }
+
+    /**
+     * @return iterable<string, array{0: string, 1: string}>
+     */
+    public static function scalarTopLevelJsonProvider(): iterable
+    {
+        yield 'string' => ['"a-secret-string-value"', 'string'];
+        yield 'integer' => ['123456789', 'int'];
+        yield 'float' => ['3.14159', 'float'];
+        yield 'true' => ['true', 'bool'];
+        yield 'false' => ['false', 'bool'];
+    }
+
+    /**
+     * A JSON string, number, or boolean is all syntactically valid JSON
+     * at the top level, so json_decode() never throws for any of these —
+     * distinct from test_a_non_json_body_fails_with_a_clear_error() above,
+     * which covers a body that fails to parse at all. Before this fix, a
+     * bare `return $decoded;` for one of these let PHP's own TypeError
+     * escape instead of this package's own documented exception.
+     * getMessage() reports only the decoded value's own type category —
+     * the same safe-by-default policy this class already applies to a
+     * response body/transport-failure message — never the raw value
+     * itself, which is only reachable via diagnosticBody().
+     */
+    #[DataProvider('scalarTopLevelJsonProvider')]
+    public function test_a_scalar_top_level_json_body_throws_a_clear_error_instead_of_a_type_error(
+        string $body,
+        string $expectedType,
+    ): void {
+        $http = new Http(new MockHttpClient(
+            static fn (): MockResponse => new MockResponse($body, ['http_code' => 200]),
+        ));
+
+        try {
+            $http->get('https://example.test/value')->json();
+
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            self::assertSame(200, $e->status);
+            self::assertStringNotContainsString($body, $e->getMessage());
+            self::assertStringContainsString($expectedType, $e->getMessage());
+            self::assertStringContainsString('not an object or array', $e->getMessage());
+            self::assertSame($body, $e->diagnosticBody());
+        }
+    }
+
+    /**
+     * A top-level JSON null is covered separately from the scalar
+     * provider above: its own decoded PHP type name ("null") and its raw
+     * JSON text ("null") are the identical string, so there's no separate
+     * "raw value" to prove absent from getMessage() the way there is for
+     * a string/number/boolean — only that the type is reported and the
+     * real body is still reachable via diagnosticBody().
+     */
+    public function test_a_top_level_json_null_throws_a_clear_error_instead_of_a_type_error(): void
+    {
+        $http = new Http(new MockHttpClient(
+            static fn (): MockResponse => new MockResponse('null', ['http_code' => 200]),
+        ));
+
+        try {
+            $http->get('https://example.test/value')->json();
+
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            self::assertSame(200, $e->status);
+            self::assertStringContainsString('null', $e->getMessage());
+            self::assertStringContainsString('not an object or array', $e->getMessage());
+            self::assertSame('null', $e->diagnosticBody());
+        }
+    }
+
+    /**
+     * jsonPath() calls json() internally — proving it fails with the same
+     * package exception (not a TypeError) for a scalar top-level body,
+     * rather than assuming the fix in json() propagates correctly.
+     */
+    public function test_json_path_fails_with_the_same_exception_for_a_scalar_top_level_body(): void
+    {
+        $http = new Http(new MockHttpClient(
+            static fn (): MockResponse => new MockResponse('"just a string"', ['http_code' => 200]),
+        ));
+
+        $this->expectException(HttpRequestException::class);
+        $this->expectExceptionMessage('not an object or array');
+        $http->get('https://example.test/value')->jsonPath('anything');
+    }
+
+    /**
+     * @return iterable<string, list<string>>
+     */
+    public static function emptyTopLevelJsonContainerProvider(): iterable
+    {
+        yield 'empty object' => ['{}'];
+        yield 'empty array' => ['[]'];
+    }
+
+    /**
+     * associative: true decodes both an empty JSON object and an empty
+     * JSON array to the identical empty PHP array — there's no way to
+     * tell them apart once decoded, and json()'s own array-oriented
+     * contract doesn't need to: both are valid, successful top-level
+     * containers, not the scalar/null case this fix rejects.
+     */
+    #[DataProvider('emptyTopLevelJsonContainerProvider')]
+    public function test_an_empty_top_level_json_container_decodes_successfully(string $body): void
+    {
+        $http = new Http(new MockHttpClient(
+            static fn (): MockResponse => new MockResponse($body, ['http_code' => 200]),
+        ));
+
+        self::assertSame([], $http->get('https://example.test/value')->json());
     }
 
     public function test_the_body_is_read_once_and_reusable(): void

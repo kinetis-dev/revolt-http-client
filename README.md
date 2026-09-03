@@ -18,10 +18,14 @@
 
 ---
 
+Part of [Kinetis](https://kinetis.dev/), a non-blocking PHP framework for
+API-first applications, developed in the
+[kinetis-dev/kinetis](https://github.com/kinetis-dev/kinetis) monorepo.
+
 Built for Kinetis, but usable in
 any PHP project — this package depends on nothing beyond
 `symfony/http-client` (and its `symfony/http-client-contracts`) and
-`amphp/http-client`. No `kinetis/framework` required.
+`amphp/http-client`. No [`kinetis/framework`](https://github.com/kinetis-dev/framework) required.
 
 ```php
 use Kinetis\RevoltHttpClient\Http;

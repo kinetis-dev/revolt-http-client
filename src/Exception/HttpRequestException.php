@@ -37,15 +37,11 @@ final class HttpRequestException extends RuntimeException
      */
     public static function errorStatus(string $method, string $url, int $status, string $body): self
     {
-        // A byte cap, not a character cap — mb_substr() would need
-        // ext-mbstring, which nothing this package requires guarantees.
-        $excerpt = strlen($body) > 500 ? substr($body, 0, 500) . '…' : $body;
-
         return new self(
             "{$method} " . self::redact($url) . " returned HTTP {$status}.",
             $status,
             diagnosticUrl: $url,
-            diagnosticBody: $excerpt,
+            diagnosticBody: self::excerptOf($body),
         );
     }
 
@@ -83,6 +79,30 @@ final class HttpRequestException extends RuntimeException
             $status,
             diagnosticUrl: $url,
             previous: $previous,
+        );
+    }
+
+    /**
+     * The body is valid JSON, but its top-level value isn't a JSON object
+     * or array — a syntactically valid, but unusable, body for `json()`/
+     * `jsonPath()`'s own array-oriented contract (a bare JSON string,
+     * number, boolean, or `null`). Distinct from notJson() above: since
+     * json_decode() itself already succeeded here, there's no
+     * JsonException to report a safe category of — $type is the decoded
+     * value's own PHP type name (`get_debug_type()`'s output — "string",
+     * "int", "float", "bool", or "null"), never the value itself, the
+     * same safe-by-default policy every other constructor here already
+     * follows. $body's own excerpt (which does reveal the actual value)
+     * is still captured as diagnosticBody(), exactly like errorStatus().
+     */
+    public static function unexpectedJsonType(string $method, string $url, int $status, string $body, string $type): self
+    {
+        return new self(
+            "{$method} " . self::redact($url) . " returned HTTP {$status} with a JSON body that decoded to "
+                . "a {$type}, not an object or array.",
+            $status,
+            diagnosticUrl: $url,
+            diagnosticBody: self::excerptOf($body),
         );
     }
 
@@ -143,6 +163,15 @@ final class HttpRequestException extends RuntimeException
         $lastBackslash = strrpos($class, '\\');
 
         return $lastBackslash === false ? $class : substr($class, $lastBackslash + 1);
+    }
+
+    /**
+     * A byte cap, not a character cap — mb_substr() would need
+     * ext-mbstring, which nothing this package requires guarantees.
+     */
+    private static function excerptOf(string $body): string
+    {
+        return strlen($body) > 500 ? substr($body, 0, 500) . '…' : $body;
     }
 
     /**
