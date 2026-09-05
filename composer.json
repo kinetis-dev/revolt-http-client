@@ -12,7 +12,8 @@
         "php": "^8.4",
         "symfony/http-client": "^8.1.4",
         "symfony/http-client-contracts": "^3.7.1",
-        "amphp/http-client": "^5.3.6"
+        "amphp/http-client": "^5.3.6",
+        "revolt/event-loop": "^1.0.9"
     },
     "require-dev": {
         "infection/infection": "^0.35.0",

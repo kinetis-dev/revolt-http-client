@@ -30,10 +30,10 @@ any PHP project — this package depends on nothing beyond
 ```php
 use Kinetis\RevoltHttpClient\Http;
 
-$http = new Http()->withBaseUrl('https://api.example.com')->withToken($key);
+$api = new Http()->withBaseUrl('https://api.example.com')->withToken($key);
 
-$orders = $http->get('/orders', ['status' => 'open'])->throw()->json();
-$http->post('/orders', ['sku' => 'A1', 'quantity' => 2]);
+$orders = $api->get('/orders', ['status' => 'open'])->throw()->json();
+$api->post('/orders', ['sku' => 'A1', 'quantity' => 2]);
 ```
 
 A request made through this client suspends the calling Fiber and yields
@@ -41,14 +41,52 @@ back to Revolt's event loop while waiting on the network, instead of
 blocking the whole process — so several run at once through
 `Kinetis\Async\concurrently()` with no pooling API of its own.
 
-An error status is returned rather than thrown: `successful()`,
-`failed()`, `clientError()`, and `serverError()` are answers to branch
-on, and `throw()` opts into raising instead. Read the body with
-`json()`, `jsonPath('customer.email')`, or `body()`.
+## What it guarantees
+
+- **Every input is checked before a transport object exists.** The
+  transport, base URI, URL, method, headers, query, body, options,
+  timeout, retry count, and response-byte ceiling each have a shape this
+  client will send and one it refuses. A refused call reaches no network
+  at all.
+- **A credential is pinned to one origin.** A client carrying an
+  `Authorization`, `Cookie`, or `Proxy-Authorization` header requires
+  `withBaseUrl()`, and then every URL it accepts is relative to that
+  base. Another origin is another client.
+- **Redirects are never followed.** A 3xx is a terminal response with a
+  `Location` to read. Following one means deciding, per response,
+  whether a new origin may see this client's `Authorization` header,
+  cookies, and body — a decision belonging to the caller who knows what
+  the credential is for.
+- **One retry layer, and one total deadline.** `withRetries()` is the
+  only way to configure retries, the transport underneath makes one wire
+  attempt per request, a retrying transport is refused where it is
+  injected, a per-call retry option is refused rather than merged, and a
+  body that cannot be replayed is refused rather than resent.
+  `withTimeout()` bounds the whole operation on a monotonic clock —
+  every attempt, every backoff, and every read of the response — and is
+  enforced here rather than trusted to the transport.
+- **A bounded response.** `withMaxResponseBytes()` is the ceiling a body
+  may reach, enforced while it arrives rather than once it is already in
+  memory. Every request asks for identity encoding, so the bytes counted
+  are the bytes held rather than the bytes off the wire.
+- **Failures carry no secrets.** `HttpRequestException` — the one
+  exception type this package throws — carries the request method, the
+  origin, a status, and a category from a fixed list. No path, no query
+  string, no header, no credential, no body, and no vendor exception
+  chained behind it.
+
+An error status is not one of those failures: `successful()`, `failed()`,
+`clientError()`, `serverError()`, and `redirect()` are answers to branch
+on, and `throw()` opts into raising instead. Read the body with `json()`,
+`jsonPath('customer.email')`, or `body()`.
 
 `AmpHttpClientFactory::create()` returns the underlying Symfony
 `HttpClientInterface` on its own, for libraries that want to be handed a
-client:
+client. It is a plain Symfony client and a deliberate escape hatch: none
+of the guarantees above apply to it — redirect following and Symfony's
+own Amp-level request retries included. `createWithoutRetries()` is the
+same client with one wire attempt per request, which is what `Http`
+itself is built on.
 
 ```php
 use Kinetis\RevoltHttpClient\AmpHttpClientFactory;
