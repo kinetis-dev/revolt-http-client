@@ -5,193 +5,170 @@ declare(strict_types=1);
 namespace Kinetis\RevoltHttpClient\Exception;
 
 use RuntimeException;
-use Throwable;
 
+/**
+ * The only exception this package throws, across every path: input
+ * validation, body encoding, transport construction, the transport
+ * itself, the total timeout, a response past its byte ceiling, an error
+ * status a caller asked to raise on, and response decoding.
+ *
+ * Every instance is built here, from fixed text plus values this package
+ * has already validated — the request method, the origin (scheme, host,
+ * and non-default port) of the request, an HTTP status, and a
+ * {@see HttpFailure} category. Nothing else reaches it. A vendor
+ * exception is never chained and its message is never copied, because a
+ * lower-level HTTP or DNS client routinely names the full URI it failed
+ * on — userinfo, path, and query string included — and an exception
+ * message is the one thing a logging pipeline records by default. The
+ * category is what a caller branches on; the message is prose.
+ *
+ * Nothing this class stores can name a path, a query value, a header, a
+ * credential, or a body, so an instance is safe to log whole:
+ * `getMessage()`, `(string) $e`, `getTraceAsString()`, and
+ * `serialize($e)` all stay within that guarantee. Trace arguments are
+ * covered separately, by `#[\SensitiveParameter]` on every parameter
+ * that forwards caller input.
+ */
 final class HttpRequestException extends RuntimeException
 {
     private function __construct(
         string $message,
+        public readonly HttpFailure $category,
         public readonly int $status,
-        private readonly ?string $diagnosticUrl = null,
-        private readonly ?string $diagnosticBody = null,
-        ?Throwable $previous = null,
     ) {
-        parent::__construct($message, $status, $previous);
+        parent::__construct($message, $status);
     }
 
     /**
-     * getMessage() deliberately excludes the response body and the
-     * request URL's userinfo/query string — a query string routinely
-     * carries a signed URL's signature, an API key, or a reset token,
-     * and an upstream error body can carry PII, credentials, or payment
-     * details. Framework/job exception paths commonly log an exception's
-     * message (and the exception object itself) by default, which would
-     * otherwise turn routine error logging into data exfiltration. The
-     * full, unredacted request URL and a truncated response-body excerpt
-     * are still reachable, but only through the explicit diagnosticUrl()/
-     * diagnosticBody()/diagnosticMessage() accessors below — never assumed
-     * safe to log without a deliberate choice to include them, and never
-     * reachable through a generic serializer either: both fields are
-     * private, so json_encode($exception) (or any other implicit
-     * reflection over the object's public state) never exposes them.
+     * A client configured with something this package will not send.
+     * $problem is fixed text written at the call site, never caller
+     * input — the same rule every constructor here follows.
      */
-    public static function errorStatus(string $method, string $url, int $status, string $body): self
+    public static function invalidConfiguration(string $problem): self
     {
-        return new self(
-            "{$method} " . self::redact($url) . " returned HTTP {$status}.",
-            $status,
-            diagnosticUrl: $url,
-            diagnosticBody: self::excerptOf($body),
-        );
+        return new self("This HTTP client cannot be configured that way: {$problem}", HttpFailure::InvalidConfiguration, 0);
+    }
+
+    /** A per-call URL, header, query, body, option, or shape this package will not send. */
+    public static function invalidRequest(string $problem): self
+    {
+        return new self("This HTTP request cannot be sent: {$problem}", HttpFailure::InvalidRequest, 0);
+    }
+
+    /** Encoding a request body failed — an unencodable value reached the encoder. */
+    public static function bodyEncodingFailed(string $encoding): self
+    {
+        return new self("The request body could not be encoded as {$encoding}.", HttpFailure::Conversion, 0);
     }
 
     /**
-     * No response at all — DNS failure, a refused connection, a timeout.
-     * `$status` is 0, since there is no HTTP answer to report.
-     *
-     * getMessage() never includes $previous->getMessage() verbatim — a
-     * transport exception commonly names the URL it failed to reach,
-     * userinfo and all (confirmed directly: a real connection failure to
-     * a userinfo-bearing URL produced a message with the raw credentials
-     * embedded in it), so copying that untrusted text into this class's
-     * own safe-by-default message would defeat the redaction above
-     * entirely. Only the previous exception's own class name — never its
-     * message — is included; the full original is still reachable via
-     * getPrevious(), a deliberate call rather than an implicit one.
+     * No response arrived, or the transport refused the request as
+     * constructed. `$status` is 0: there is no HTTP answer to report.
      */
-    public static function transportFailure(string $method, string $url, Throwable $previous): self
+    public static function transportFailure(string $method, string $origin): self
+    {
+        return new self("{$method} {$origin} failed before any response arrived.", HttpFailure::Transport, 0);
+    }
+
+    /** The whole operation — every attempt and every backoff between them — ran past its budget. */
+    public static function timedOut(string $method, string $origin, float $budget, int $attempts): self
     {
         return new self(
-            "{$method} " . self::redact($url) . ' failed before any response arrived: '
-                . self::safeCategory($previous) . '. See getPrevious() for the original exception.',
+            sprintf('%s %s ran out of its %.3Fs total timeout after %d attempt(s).', $method, $origin, $budget, $attempts),
+            HttpFailure::Timeout,
             0,
-            diagnosticUrl: $url,
-            previous: $previous,
         );
     }
 
-    /** See transportFailure() for why $previous->getMessage() is never included here. */
-    public static function notJson(string $method, string $url, int $status, Throwable $previous): self
+    /**
+     * The response body passed the ceiling
+     * {@see \Kinetis\RevoltHttpClient\Http::withMaxResponseBytes()} sets.
+     * The status is 0 whichever way the ceiling was reached: a transfer
+     * aborted part-way has no complete answer to report, and a declared
+     * length refused before the body was fetched has no body behind it,
+     * so one fixed status keeps the two indistinguishable from outside.
+     */
+    public static function responseTooLarge(string $method, string $origin, int $maxBytes): self
     {
         return new self(
-            "{$method} " . self::redact($url) . " returned HTTP {$status} with a body that is not valid JSON ("
-                . self::safeCategory($previous) . '). See getPrevious() for the original exception.',
-            $status,
-            diagnosticUrl: $url,
-            previous: $previous,
+            "{$method} {$origin} returned a response past the {$maxBytes}-byte ceiling this client allows.",
+            HttpFailure::ResponseTooLarge,
+            0,
         );
     }
 
-    /**
-     * The body is valid JSON, but its top-level value isn't a JSON object
-     * or array — a syntactically valid, but unusable, body for `json()`/
-     * `jsonPath()`'s own array-oriented contract (a bare JSON string,
-     * number, boolean, or `null`). Distinct from notJson() above: since
-     * json_decode() itself already succeeded here, there's no
-     * JsonException to report a safe category of — $type is the decoded
-     * value's own PHP type name (`get_debug_type()`'s output — "string",
-     * "int", "float", "bool", or "null"), never the value itself, the
-     * same safe-by-default policy every other constructor here already
-     * follows. $body's own excerpt (which does reveal the actual value)
-     * is still captured as diagnosticBody(), exactly like errorStatus().
-     */
-    public static function unexpectedJsonType(string $method, string $url, int $status, string $body, string $type): self
+    /** A response arrived and {@see \Kinetis\RevoltHttpClient\HttpResponse::throw()} was asked to raise on it. */
+    public static function errorStatus(string $method, string $origin, int $status): self
+    {
+        return new self("{$method} {$origin} returned HTTP {$status}.", HttpFailure::ErrorStatus, $status);
+    }
+
+    /** The body does not parse as JSON at all. Its text is never quoted here. */
+    public static function malformedJson(string $method, string $origin, int $status): self
     {
         return new self(
-            "{$method} " . self::redact($url) . " returned HTTP {$status} with a JSON body that decoded to "
-                . "a {$type}, not an object or array.",
+            "{$method} {$origin} returned HTTP {$status} with a body that is not valid JSON.",
+            HttpFailure::Conversion,
             $status,
-            diagnosticUrl: $url,
-            diagnosticBody: self::excerptOf($body),
         );
     }
 
     /**
-     * The full, unredacted request URL captured at construction — the
-     * complete userinfo and query string getMessage() deliberately
-     * strips. Call this only where logging that detail is a deliberate,
-     * considered choice, not a default.
+     * The body is valid JSON whose top-level value is a bare string,
+     * number, boolean, or null — syntactically fine, and outside the
+     * array-shaped contract of `json()`/`jsonPath()`. $type is
+     * `get_debug_type()`'s output for the decoded value, never the value.
      */
-    public function diagnosticUrl(): ?string
+    public static function unexpectedJsonType(string $method, string $origin, int $status, string $type): self
     {
-        return $this->diagnosticUrl;
+        return new self(
+            "{$method} {$origin} returned HTTP {$status} with a JSON body that decoded to a {$type}, not an object or array.",
+            HttpFailure::Conversion,
+            $status,
+        );
+    }
+
+    /** A read was attempted on a response whose body had already been released. */
+    public static function discarded(string $method, string $origin): self
+    {
+        return new self(
+            "{$method} {$origin} was discarded; its body was released and cannot be read.",
+            HttpFailure::Discarded,
+            0,
+        );
     }
 
     /**
-     * The response-body excerpt captured at construction (null when
-     * nothing was captured — a transport failure has no response body at
-     * all). Call this only where logging that detail is a deliberate,
-     * considered choice, not a default.
+     * Serialization carries the safe scalars and nothing else. The
+     * default would carry the stack trace, whose arguments hold whatever
+     * the caller passed in; PHP's own `#[\SensitiveParameter]` marker
+     * keeps those out of rendered traces but is still an object holding
+     * the value, so the trace is dropped here rather than serialized.
+     *
+     * @return array{message: string, code: int, file: string, line: int, category: HttpFailure, status: int}
      */
-    public function diagnosticBody(): ?string
+    public function __serialize(): array
     {
-        return $this->diagnosticBody;
+        return [
+            'message' => $this->getMessage(),
+            'code' => $this->getCode(),
+            'file' => $this->getFile(),
+            'line' => $this->getLine(),
+            'category' => $this->category,
+            'status' => $this->status,
+        ];
     }
 
     /**
-     * The full, unredacted detail getMessage() deliberately omits — the
-     * complete request URL (userinfo and query string included) and the
-     * response-body excerpt, when either was captured. Call this only
-     * where logging that detail is a deliberate, considered choice, not
-     * a default.
+     * @param array{message?: string, code?: int, file?: string, line?: int, category?: HttpFailure, status?: int} $data
      */
-    public function diagnosticMessage(): string
+    public function __unserialize(array $data): void
     {
-        $message = $this->getMessage();
-
-        if ($this->diagnosticUrl !== null) {
-            $message .= " URL: {$this->diagnosticUrl}";
-        }
-
-        if ($this->diagnosticBody !== null && $this->diagnosticBody !== '') {
-            $message .= " Response: {$this->diagnosticBody}";
-        }
-
-        return $message;
-    }
-
-    /**
-     * The previous exception's own short class name (e.g.
-     * "TransportException"), never its message — a safe-by-default
-     * category to include in getMessage() when a lower-level exception's
-     * own text can't be trusted not to carry a secret. The full original
-     * throwable, message included, is always reachable via getPrevious().
-     */
-    private static function safeCategory(Throwable $previous): string
-    {
-        $class = $previous::class;
-        $lastBackslash = strrpos($class, '\\');
-
-        return $lastBackslash === false ? $class : substr($class, $lastBackslash + 1);
-    }
-
-    /**
-     * A byte cap, not a character cap — mb_substr() would need
-     * ext-mbstring, which nothing this package requires guarantees.
-     */
-    private static function excerptOf(string $body): string
-    {
-        return strlen($body) > 500 ? substr($body, 0, 500) . '…' : $body;
-    }
-
-    /**
-     * Scheme, host, port, and path only — strips userinfo ("user:pass@")
-     * and the query string, the two parts of a URL most likely to carry
-     * a secret. Never throws: an unparseable URL falls back to a plain,
-     * non-empty placeholder rather than surfacing a second exception
-     * while building the first one's message.
-     */
-    private static function redact(string $url): string
-    {
-        $parts = parse_url($url);
-
-        if ($parts === false) {
-            return '(unparseable URL)';
-        }
-
-        $authority = ($parts['host'] ?? '') . (isset($parts['port']) ? ":{$parts['port']}" : '');
-        $scheme = isset($parts['scheme']) ? "{$parts['scheme']}://" : '';
-
-        return $scheme . $authority . ($parts['path'] ?? '');
+        $this->message = $data['message'] ?? '';
+        $this->code = $data['code'] ?? 0;
+        $this->file = $data['file'] ?? __FILE__;
+        $this->line = $data['line'] ?? 0;
+        $this->category = $data['category'] ?? HttpFailure::Transport;
+        $this->status = $data['status'] ?? 0;
     }
 }

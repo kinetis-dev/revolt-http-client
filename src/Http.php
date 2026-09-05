@@ -4,28 +4,29 @@ declare(strict_types=1);
 
 namespace Kinetis\RevoltHttpClient;
 
-use InvalidArgumentException;
-use Symfony\Component\HttpClient\RetryableHttpClient;
+use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
+use SensitiveParameter;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
+use Symfony\Contracts\HttpClient\ResponseInterface;
+use Throwable;
 
 /**
  * An HTTP client for application code: verbs that take arrays and return
- * a {@see HttpResponse}, over a transport that suspends the calling Fiber
- * instead of blocking the process.
+ * a {@see HttpResponse}, over a transport that suspends the calling
+ * Fiber instead of blocking the process.
  *
- *     $orders = $http->withToken($apiKey)
- *         ->get('https://api.example.com/orders', ['status' => 'open'])
+ *     $orders = $http->withBaseUrl('https://api.example.com')
+ *         ->withToken($apiKey)
+ *         ->get('/orders', ['status' => 'open'])
  *         ->throw()
  *         ->json();
  *
  * Constructed with no arguments it uses {@see AmpHttpClientFactory}'s
  * Revolt-backed transport, so it autowires straight into a controller or
- * job with nothing to register. Pass any Symfony `HttpClientInterface` to
- * use a different one — a mock in a test, a scoped or instrumented client
- * in production. Under a persistent worker, register a configured
- * instance on AppScope rather than autowiring per request — autowiring
- * builds a fresh transport, and with it a fresh connection pool, each
- * time, losing keep-alive reuse across requests.
+ * job with nothing to register. Under a persistent worker, register a
+ * configured instance on AppScope rather than autowiring per request —
+ * autowiring builds a fresh transport, and with it a fresh connection
+ * pool, each time, losing keep-alive reuse across requests.
  *
  * Every `with*` method returns a new instance rather than mutating this
  * one, so a configured client is safe to hold as a shared service and
@@ -42,11 +43,105 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
  *         fn () => $api->get("/users/{$id}")->json(),
  *         fn () => $api->get("/users/{$id}/orders")->json(),
  *     ]);
+ *
+ * What this client guarantees, and what each guarantee costs:
+ *
+ * - **Every input is checked before a transport object exists.**
+ *   {@see Preflight} validates the transport, the base URI, the URL, the
+ *   method, the headers, the query, the body, the options, the timeout,
+ *   the retry count, and the response-byte ceiling. A rejected call
+ *   makes no transport call at all, and fails with
+ *   {@see HttpRequestException}, the only exception type this package
+ *   throws.
+ * - **A credential is pinned to one origin.** A client carrying an
+ *   `Authorization`, `Cookie`, or `Proxy-Authorization` header — set
+ *   directly or through {@see withToken()}/{@see withBasicAuth()} —
+ *   needs {@see withBaseUrl()}, and then every URL it accepts is
+ *   relative to that base. Another origin is another client.
+ * - **Redirects are never followed.** A 3xx is a terminal response with
+ *   a `Location` header to read. Following one would mean deciding, per
+ *   response, whether the new origin may see this client's
+ *   Authorization header, cookies, and body — a decision belonging to
+ *   the caller who knows what the credential is for.
+ * - **One retry layer, owned here.** {@see withRetries()} is the only
+ *   way to configure it, a per-call retry option is rejected, a
+ *   retrying transport is rejected at construction, and a body that
+ *   cannot be replayed is rejected rather than resent.
+ * - **One total deadline, on a monotonic clock.**
+ *   {@see withTimeout()} bounds the whole operation — every attempt,
+ *   every backoff between them, and every read of the response that
+ *   comes out of it.
+ * - **A bounded response.** {@see withMaxResponseBytes()} is the
+ *   ceiling a body may reach, enforced while it arrives rather than
+ *   after it is already in memory.
+ *
+ * **What an injected transport must be.** Pass any Symfony
+ * `HttpClientInterface` to use a different one — a mock in a test, an
+ * instrumented client in production. The guarantees above are this
+ * package's, and two of them need the transport's cooperation: it must
+ * not retry (a client that does is rejected outright), and it must not
+ * carry credentials or a base URI of its own, which the origin pinning
+ * above cannot see and therefore cannot pin. A transport that does
+ * carry them answers for where they go. A synchronous transport —
+ * Symfony's `CurlHttpClient` or `NativeHttpClient` — is accepted and
+ * blocks the process for the length of the request; only the
+ * Revolt-backed default suspends the calling Fiber.
  */
 final class Http
 {
+    /**
+     * Statuses worth sending the same request for again: the server
+     * either said so (429, 503 with a queue behind them) or failed in a
+     * way that is commonly transient. Every other status, 4xx included,
+     * is an answer — repeating the request cannot change it.
+     */
+    private const array RETRYABLE_STATUSES = [423, 425, 429, 500, 502, 503, 504, 507, 509];
+
+    /** Doubling from here, and always inside the total timeout. */
+    private const float FIRST_BACKOFF_SECONDS = 0.1;
+
+    /**
+     * Header names that carry a credential to whatever origin the
+     * request reaches, and so make {@see withBaseUrl()} mandatory.
+     */
+    private const array CREDENTIAL_HEADERS = ['authorization', 'cookie'];
+
+    /**
+     * Asked for on every request, and not a caller's to change. With no
+     * `Accept-Encoding` of its own a Symfony response inflates a
+     * compressed body transparently, which would make the byte ceiling
+     * a bound on what arrived rather than on what is held: a kilobyte
+     * off the wire becomes a megabyte in memory before anything can
+     * measure it. Asking for identity turns that inflation off, so the
+     * bytes counted and the bytes held are the same bytes — including
+     * when a server answers with a compressed body anyway, which then
+     * arrives, and is bounded, as the compressed bytes it is.
+     */
+    private const array IDENTITY_ENCODING = ['name' => 'Accept-Encoding', 'values' => ['identity']];
+
+    /** Bounds an operation that never got one from the caller. */
+    public const float DEFAULT_TIMEOUT_SECONDS = 30.0;
+
+    /**
+     * Bounds a response body that never got a ceiling from the caller:
+     * generous for an API payload, and far below what it takes to
+     * exhaust a worker's memory with one reply.
+     */
+    public const int DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+    private ?BaseUri $baseUri = null;
+
+    /** @var array<string, array{name: string, values: non-empty-list<string>}> */
+    private array $headers = [];
+
     /** @var array<string, mixed> */
-    private array $options = [];
+    private array $query = [];
+
+    private float $timeout = self::DEFAULT_TIMEOUT_SECONDS;
+
+    private int $maxResponseBytes = self::DEFAULT_MAX_RESPONSE_BYTES;
+
+    private int $retries = 0;
 
     private bool $sendAsForm = false;
 
@@ -56,80 +151,157 @@ final class Http
     {
         // Defaults through this package's own factory rather than
         // Symfony's class directly, so the Revolt-backed transport and
-        // its defaults stay defined in one place.
-        $this->transport = $transport ?? AmpHttpClientFactory::create();
+        // its defaults stay defined in one place — and through the
+        // variant that adds no retry layer of its own beneath this
+        // client's, which is the whole of what "one retry layer" means.
+        $this->transport = Preflight::transport($transport) ?? AmpHttpClientFactory::createWithoutRetries();
     }
 
     /**
-     * Prefixed to every relative URL, so call sites carry paths rather
-     * than repeating the host.
-     */
-    public function withBaseUrl(string $baseUrl): self
-    {
-        return $this->withOptions(['base_uri' => $baseUrl]);
-    }
-
-    /**
-     * A later call overrides an earlier one for the same header name,
-     * matching HTTP's own case-insensitive field-name semantics — a
-     * second `withHeaders(['authorization' => ...])` replaces an earlier
-     * `withHeaders(['Authorization' => ...])` entirely, not alongside it.
-     * See {@see mergeHeaders()} for how that's guaranteed rather than
-     * left to depend on Symfony's own internal header normalization.
+     * Prefixed to every request this client makes, so call sites carry
+     * paths rather than repeating the host. The base URI is absolute,
+     * http or https, and carries no userinfo, query string, or fragment.
      *
-     * @param array<string, string> $headers
+     * Its path is a prefix, joined by concatenation and never replaced:
+     * a base of `https://api.example.com/v1` sends `/orders` to
+     * `https://api.example.com/v1/orders`, with or without the leading
+     * slash on either side. Once a base URI is set, a request URL must
+     * be relative to it, which is what keeps a configured Authorization
+     * header on the origin it was meant for.
      */
-    public function withHeaders(array $headers): self
+    public function withBaseUrl(#[SensitiveParameter] string $baseUrl): self
     {
-        /** @var array<array-key, mixed> $existing */
-        $existing = $this->options['headers'] ?? [];
+        $clone = clone $this;
+        $clone->baseUri = Preflight::baseUri($baseUrl);
 
-        return $this->withOptions(['headers' => self::mergeHeaders($existing, $headers)]);
+        return $clone;
     }
 
-    public function withToken(string $token, string $scheme = 'Bearer'): self
+    /**
+     * Headers in either documented form — associative `'Name' =>
+     * 'value'` or `'Name' => ['v1', 'v2']`, and raw `"Name: value"`
+     * lines under integer keys, one form per array — validated by
+     * {@see Preflight::headers()} and merged over what this client
+     * already carries.
+     *
+     * A later call replaces an earlier one for the same field name,
+     * case-insensitively, matching HTTP's own case-insensitive field
+     * names: a second `withHeaders(['authorization' => ...])` replaces
+     * an earlier `withHeaders(['Authorization' => ...])` entirely,
+     * rather than sending both.
+     *
+     * @param array<array-key, mixed> $headers
+     */
+    public function withHeaders(#[SensitiveParameter] array $headers): self
     {
-        return $this->withHeaders(['Authorization' => trim("{$scheme} {$token}")]);
+        $clone = clone $this;
+        // Array union keeps the left operand's value for a shared key,
+        // so the new headers win over the ones already configured.
+        $clone->headers = Preflight::headers($headers) + $this->headers;
+
+        return $clone;
     }
 
-    public function withBasicAuth(string $username, #[\SensitiveParameter] string $password): self
+    /** An `Authorization` header built from a token and a scheme name. */
+    public function withToken(#[SensitiveParameter] string $token, string $scheme = 'Bearer'): self
     {
-        return $this->withOptions(['auth_basic' => [$username, $password]]);
+        $scheme = Preflight::authScheme($scheme);
+        $token = Preflight::credential($token, 'an authentication token');
+
+        return $this->withHeaders(['Authorization' => "{$scheme} {$token}"]);
+    }
+
+    /**
+     * An `Authorization` header carrying basic credentials. Built here
+     * rather than handed to the transport as an option, so credentials
+     * follow the same one-header-per-name merge as everything else.
+     */
+    public function withBasicAuth(#[SensitiveParameter] string $userId, #[SensitiveParameter] string $password): self
+    {
+        $userId = Preflight::basicUserId($userId);
+        $password = Preflight::credential($password, 'a basic-auth password');
+
+        return $this->withHeaders(['Authorization' => 'Basic ' . base64_encode("{$userId}:{$password}")]);
     }
 
     /**
      * Query parameters merged into every request this client makes, on
      * top of whatever a verb method is given.
      *
-     * @param array<string, mixed> $query
+     * @param array<array-key, mixed> $query
      */
-    public function withQuery(array $query): self
+    public function withQuery(#[SensitiveParameter] array $query): self
     {
-        /** @var array<string, mixed> $existing */
-        $existing = $this->options['query'] ?? [];
+        $clone = clone $this;
+        $clone->query = [...$this->query, ...Preflight::query($query)];
 
-        return $this->withOptions(['query' => [...$existing, ...$query]]);
-    }
-
-    /** Seconds to wait for the response, total. */
-    public function withTimeout(float $seconds): self
-    {
-        return $this->withOptions(['timeout' => $seconds]);
+        return $clone;
     }
 
     /**
-     * Retries failed requests, using Symfony's own retry strategy —
-     * 5xx, 429, and connection failures, with exponential backoff, and
-     * never a request that already reached a definitive answer.
+     * The total budget for one operation, in seconds: every attempt,
+     * every backoff between them, and every read of the response that
+     * comes out of it, measured on a monotonic clock. Running out throws
+     * {@see HttpRequestException} with the `Timeout` category.
+     */
+    public function withTimeout(float $seconds): self
+    {
+        $clone = clone $this;
+        $clone->timeout = Preflight::timeout($seconds);
+
+        return $clone;
+    }
+
+    /**
+     * The ceiling one response body may reach, in bytes, replacing
+     * {@see DEFAULT_MAX_RESPONSE_BYTES}. See {@see HttpResponse::body()}
+     * for when the ceiling is checked and what passing it costs.
+     */
+    public function withMaxResponseBytes(int $bytes): self
+    {
+        $clone = clone $this;
+        $clone->maxResponseBytes = Preflight::responseByteCeiling($bytes);
+
+        return $clone;
+    }
+
+    /**
+     * Sends a failed request again, up to $times more times, with
+     * exponential backoff from 100 ms, for either kind of failure this
+     * client can survive a repeat of:
      *
-     * Applies to this client's transport, so a retrying client is
-     * normally built once and reused rather than per call.
+     * - a transport failure, whether the transport refused the request
+     *   as it was built or the response never arrived;
+     * - a status the server itself marks as worth repeating (423, 425,
+     *   429, 500, 502, 503, 504, 507, 509).
+     *
+     * Every other status is returned as it is, and so is the last
+     * status of an attempt that ran out of retries. A transport failure
+     * that outlives them has no response to hand back, so it throws.
+     *
+     * This is the only retry layer: a transport that retries on its own
+     * is rejected at construction, a per-call retry option is rejected
+     * rather than merged, and a request whose body is a stream or a
+     * Closure is rejected outright, because such a body is consumed as
+     * it is read and a second attempt would send a body that is already
+     * gone. A response past the byte ceiling is not retried either —
+     * the same request would fetch the same oversized body again.
+     *
+     * A retrying client waits for the response status inside `send()`,
+     * since that status is what the decision is made on; without
+     * retries, `send()` returns as soon as the request is issued and
+     * every read stays deferred.
+     *
+     * Retrying a request that is not idempotent is the caller's call to
+     * make: neither a 5xx nor a dropped connection proves the server did
+     * not already act on it.
      */
     public function withRetries(int $times = 3): self
     {
-        return new self(new RetryableHttpClient($this->transport, maxRetries: $times))
-            ->withOptions($this->options)
-            ->sendingAsForm($this->sendAsForm);
+        $clone = clone $this;
+        $clone->retries = Preflight::retries($times);
+
+        return $clone;
     }
 
     /**
@@ -138,13 +310,16 @@ final class Http
      */
     public function asForm(): self
     {
-        return $this->sendingAsForm(true);
+        $clone = clone $this;
+        $clone->sendAsForm = true;
+
+        return $clone;
     }
 
     /**
-     * @param array<string, mixed> $query
+     * @param array<array-key, mixed> $query
      */
-    public function get(string $url, array $query = []): HttpResponse
+    public function get(#[SensitiveParameter] string $url, #[SensitiveParameter] array $query = []): HttpResponse
     {
         return $this->send('GET', $url, $query === [] ? [] : ['query' => $query]);
     }
@@ -152,7 +327,7 @@ final class Http
     /**
      * @param array<array-key, mixed> $body
      */
-    public function post(string $url, array $body = []): HttpResponse
+    public function post(#[SensitiveParameter] string $url, #[SensitiveParameter] array $body = []): HttpResponse
     {
         return $this->send('POST', $url, $this->bodyOption($body));
     }
@@ -160,7 +335,7 @@ final class Http
     /**
      * @param array<array-key, mixed> $body
      */
-    public function put(string $url, array $body = []): HttpResponse
+    public function put(#[SensitiveParameter] string $url, #[SensitiveParameter] array $body = []): HttpResponse
     {
         return $this->send('PUT', $url, $this->bodyOption($body));
     }
@@ -168,7 +343,7 @@ final class Http
     /**
      * @param array<array-key, mixed> $body
      */
-    public function patch(string $url, array $body = []): HttpResponse
+    public function patch(#[SensitiveParameter] string $url, #[SensitiveParameter] array $body = []): HttpResponse
     {
         return $this->send('PATCH', $url, $this->bodyOption($body));
     }
@@ -176,32 +351,240 @@ final class Http
     /**
      * @param array<array-key, mixed> $body
      */
-    public function delete(string $url, array $body = []): HttpResponse
+    public function delete(#[SensitiveParameter] string $url, #[SensitiveParameter] array $body = []): HttpResponse
     {
         return $this->send('DELETE', $url, $this->bodyOption($body));
     }
 
     /**
-     * The general form, for anything the verbs don't cover — a raw body,
-     * an upload, a header only this call needs. $options are Symfony
-     * HttpClient options, merged over this client's own.
+     * The general form, for anything the verbs do not cover — a raw
+     * body, an upload, a header only this call needs.
+     *
+     * $options is an exact map of the options this client can check:
+     * `headers`, `query`, `json`, `body`, and `timeout`. An option this
+     * client owns (`base_uri`, `max_redirects`, `max_retries`,
+     * `retry_failed`, `retry_strategy`, `max_duration`, `auth_basic`,
+     * `auth_bearer`, `on_progress`, `buffer`) is rejected and points at
+     * the builder that sets it; anything else is rejected as
+     * unsupported, because an option this boundary cannot check is an
+     * option none of the guarantees above would still hold for.
+     *
+     * `body` is the one place a caller can hand over something this
+     * package cannot inspect: a stream resource or a Closure. Those are
+     * sent as they are, and are rejected outright by a client with
+     * retries configured, since neither can be replayed.
+     *
+     * @param array<array-key, mixed> $options
+     */
+    public function send(string $method, #[SensitiveParameter] string $url, #[SensitiveParameter] array $options = []): HttpResponse
+    {
+        $method = Preflight::method($method);
+        $options = Preflight::callOptions($options);
+
+        $headers = isset($options['headers'])
+            ? Preflight::headers($options['headers']) + $this->headers
+            : $this->headers;
+
+        $this->assertCredentialsAreBoundToAnOrigin($headers);
+
+        $target = Preflight::target($this->baseUri, $url);
+
+        $query = isset($options['query'])
+            ? [...$this->query, ...Preflight::query($options['query'])]
+            : $this->query;
+
+        if ($query !== [] && $target->hasQueryString) {
+            throw HttpRequestException::invalidRequest(
+                'a request URL that already carries a query string cannot also take query parameters as an array; '
+                    . 'the two have no defined order. Put every parameter in one of them.',
+            );
+        }
+
+        [$body, $contentType] = $this->resolveBody($options);
+
+        if ($contentType !== null && !isset($headers['content-type'])) {
+            $headers['content-type'] = ['name' => 'Content-Type', 'values' => [$contentType]];
+        }
+
+        $headers['accept-encoding'] = self::IDENTITY_ENCODING;
+
+        $transportOptions = ['headers' => self::flattenHeaders($headers), 'max_redirects' => 0];
+
+        if ($query !== []) {
+            $transportOptions['query'] = $query;
+        }
+
+        if ($body !== null) {
+            $transportOptions['body'] = $body;
+        }
+
+        return $this->dispatch($method, $target, $transportOptions, $options['timeout'] ?? $this->timeout);
+    }
+
+    /**
+     * A credential is only safe to attach to a request when the request
+     * cannot reach an origin the credential was not issued for. The base
+     * URI is what makes that true: with one set, every URL this client
+     * accepts is relative to it, an absolute or scheme-relative target
+     * is rejected, and a 3xx is never followed. Without one, a call site
+     * chooses the whole URL, which would mean a call site chooses who
+     * receives the Authorization header.
+     *
+     * Reaching a second origin is a second client, configured with the
+     * credential that origin should see. A `Proxy-Authorization` header
+     * is addressed to a proxy rather than to the origin, so a base URI
+     * cannot confine it at all; {@see Preflight::headers()} rejects it
+     * outright instead of pinning it to something it does not go to.
+     *
+     * @param array<string, array{name: string, values: non-empty-list<string>}> $headers
+     */
+    private function assertCredentialsAreBoundToAnOrigin(#[SensitiveParameter] array $headers): void
+    {
+        if ($this->baseUri !== null || array_intersect_key($headers, array_flip(self::CREDENTIAL_HEADERS)) === []) {
+            return;
+        }
+
+        throw HttpRequestException::invalidConfiguration(
+            'a client carrying an Authorization, Cookie, or Proxy-Authorization header needs withBaseUrl(), '
+                . 'so the credential can only reach the one origin it was issued for; reach a second origin '
+                . 'with a second client.',
+        );
+    }
+
+    /**
+     * One attempt, then as many more as `withRetries()` allows, all
+     * inside a single deadline. The deadline is what makes the timeout
+     * total: each attempt is given only what is left of it, an attempt
+     * is never started nor a backoff waited out once nothing is left,
+     * and the {@see ResponseBudget} handed to the surviving response
+     * carries the same deadline into every read of it.
      *
      * @param array<string, mixed> $options
      */
-    public function send(string $method, string $url, array $options = []): HttpResponse
+    private function dispatch(
+        string $method,
+        #[SensitiveParameter] RequestTarget $target,
+        #[SensitiveParameter] array $options,
+        float $timeout,
+    ): HttpResponse {
+        $deadline = Deadline::startingNow($timeout);
+        $attempts = 0;
+
+        while (true) {
+            if ($deadline->expired()) {
+                throw HttpRequestException::timedOut($method, $target->origin, $timeout, $attempts);
+            }
+
+            $budget = new ResponseBudget($method, $target->origin, $deadline, $this->maxResponseBytes, ++$attempts);
+            $response = $this->issue($method, $target, $budget->applyTo($options));
+
+            // A transport is handed what is left of the deadline and is
+            // trusted with none of it: one that ignores the duration and
+            // returns — or raises — past it has still spent the budget,
+            // and that is a timeout whichever way it came back.
+            if ($deadline->expired()) {
+                self::abandon($response);
+
+                throw $budget->timedOut();
+            }
+
+            if ($this->retries === 0) {
+                // Nothing left to decide, so the response stays deferred
+                // and every read of it happens where the caller asked.
+                return $response === null
+                    ? throw $budget->transportFailure()
+                    : new HttpResponse($response, $budget);
+            }
+
+            $failed = $response === null;
+            $retryable = true;
+
+            if ($response !== null) {
+                try {
+                    $retryable = in_array(Loop::await($response->getStatusCode(...)), self::RETRYABLE_STATUSES, true);
+                } catch (Throwable) {
+                    // The transport's own exception stops here: its
+                    // message can name the full URI, credentials and all.
+                    $failed = true;
+                }
+            }
+
+            if ($budget->exceeded) {
+                self::abandon($response);
+
+                throw $budget->tooLarge();
+            }
+
+            // Waiting for the status spent part of the budget, so the
+            // deadline is asked again before anything is retried or a
+            // response is handed over that every later read would be
+            // measured against.
+            if ($deadline->expired()) {
+                self::abandon($response);
+
+                throw $budget->timedOut();
+            }
+
+            if ($retryable && $attempts <= $this->retries) {
+                self::abandon($response);
+
+                $backoff = self::FIRST_BACKOFF_SECONDS * 2 ** ($attempts - 1);
+
+                if ($backoff >= $deadline->remaining()) {
+                    throw $budget->timedOut();
+                }
+
+                Loop::pause($backoff);
+
+                continue;
+            }
+
+            if ($response === null || $failed) {
+                self::abandon($response);
+
+                throw $budget->transportFailure();
+            }
+
+            return new HttpResponse($response, $budget);
+        }
+    }
+
+    /**
+     * Issues one attempt. A transport that refuses the request as it is
+     * built raises where the request is made rather than where it is
+     * read, and that exception ends here: it comes from a library
+     * holding the full URL, and this package promises its own exceptions
+     * carry only an origin. The absent response is what the retry loop
+     * sees, so a construction failure is retried on exactly the same
+     * terms as one that surfaced from the wire.
+     *
+     * @param array<string, mixed> $options
+     */
+    private function issue(
+        string $method,
+        #[SensitiveParameter] RequestTarget $target,
+        #[SensitiveParameter] array $options,
+    ): ?ResponseInterface {
+        try {
+            return $this->transport->request($method, $target->url, $options);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Gives back a response no read will ever reach, if there is one. */
+    private static function abandon(?ResponseInterface $response): void
     {
-        return new HttpResponse(
-            $this->transport->request($method, $url, $this->mergeOptions($options)),
-            $method,
-            $url,
-        );
+        if ($response !== null) {
+            HttpResponse::release($response);
+        }
     }
 
     /**
      * @param array<array-key, mixed> $body
      * @return array<string, mixed>
      */
-    private function bodyOption(array $body): array
+    private function bodyOption(#[SensitiveParameter] array $body): array
     {
         if ($body === []) {
             return [];
@@ -211,234 +594,47 @@ final class Http
     }
 
     /**
-     * Merges per-call options over the client's, with headers and query
-     * combined key-wise rather than replaced — a call adding one header
-     * keeps the client's Authorization. Headers merge case-insensitively
-     * by name (see {@see mergeHeaders()}); query keys are ordinary,
-     * case-sensitive PHP array keys, so a plain spread is correct there.
+     * Encoding happens here, not in the transport, so a value that
+     * cannot be encoded fails as this package's own typed exception
+     * instead of a vendor one carrying the value that failed. The
+     * returned content type is a default: a caller who set one keeps it.
      *
-     * @param array<string, mixed> $options
-     * @return array<string, mixed>
+     * @param array{headers?: array<array-key, mixed>, query?: array<array-key, mixed>, json?: array<array-key, mixed>, body?: mixed, timeout?: float} $options
+     * @return array{0: mixed, 1: string|null}
      */
-    private function mergeOptions(array $options): array
+    private function resolveBody(#[SensitiveParameter] array $options): array
     {
-        $merged = [...$this->options, ...$options];
-
-        /** @var array<array-key, mixed> $myHeaders */
-        $myHeaders = $this->options['headers'] ?? [];
-        /** @var array<array-key, mixed> $theirHeaders */
-        $theirHeaders = $options['headers'] ?? [];
-
-        if ($myHeaders !== [] || $theirHeaders !== []) {
-            $merged['headers'] = self::mergeHeaders($myHeaders, $theirHeaders);
+        if (array_key_exists('json', $options)) {
+            return [Preflight::encodeJson(Preflight::bodyArray($options['json'], asForm: false)), 'application/json'];
         }
 
-        /** @var array<string, mixed> $myQuery */
-        $myQuery = $this->options['query'] ?? [];
-        /** @var array<string, mixed> $theirQuery */
-        $theirQuery = $options['query'] ?? [];
-
-        if ($myQuery !== [] || $theirQuery !== []) {
-            $merged['query'] = [...$myQuery, ...$theirQuery];
+        if (!array_key_exists('body', $options)) {
+            return [null, null];
         }
 
-        return $merged;
+        $body = Preflight::rawBody($options['body'], $this->retries > 0);
+
+        return is_array($body)
+            ? [Preflight::encodeForm($body), 'application/x-www-form-urlencoded']
+            : [$body, null];
     }
 
     /**
-     * Merges two Symfony HttpClient-shaped header arrays, case-
-     * insensitively by header name, with $theirs winning entirely over
-     * $mine for any name both define — the same "later/more specific
-     * wins" precedence this class already documents for option merging
-     * generally.
+     * The validated header map, in the shape the transport takes: one
+     * entry per field name, a single string where there is one value and
+     * a list where the caller asked for several.
      *
-     * Each side is first resolved independently, via
-     * {@see normalizeHeaderArray()}, into exactly one entry per logical
-     * header name — collapsing any same-name collision *within* that one
-     * side before the two sides are ever compared. This is deliberate,
-     * not incidental: reassembling a winning name's *raw* multiple
-     * occurrences (several numeric "Name: value" lines, or several
-     * differently-cased associative keys) back into the Symfony options
-     * array would leave Symfony's own `normalizeHeaders()` to resolve
-     * them — and it resolves multiple *separate* top-level array entries
-     * for the same name by unconditionally resetting on each one, an
-     * undocumented internal collapse, not a rule this class controls or
-     * should depend on for its own documented precedence. Normalizing
-     * first means the merged result Symfony ever sees contains at most
-     * one array entry per header name, so there is nothing left for its
-     * own normalization to have to resolve.
-     *
-     * @param array<array-key, mixed> $mine
-     * @param array<array-key, mixed> $theirs
+     * @param array<string, array{name: string, values: non-empty-list<string>}> $headers
      * @return array<string, string|list<string>>
      */
-    private static function mergeHeaders(array $mine, array $theirs): array
+    private static function flattenHeaders(#[SensitiveParameter] array $headers): array
     {
-        $mineResolved = self::normalizeHeaderArray($mine);
-        $theirsResolved = self::normalizeHeaderArray($theirs);
+        $flattened = [];
 
-        // Array union (+) keeps the LEFT operand's value for any key
-        // present in both — putting $theirsResolved first is what makes
-        // it win over $mineResolved for a shared (lowercase) name.
-        $winning = $theirsResolved + $mineResolved;
-
-        $result = [];
-
-        foreach ($winning as ['name' => $name, 'values' => $values]) {
-            $result[$name] = count($values) === 1 ? $values[0] : $values;
+        foreach ($headers as ['name' => $name, 'values' => $values]) {
+            $flattened[$name] = count($values) === 1 ? $values[0] : $values;
         }
 
-        return $result;
-    }
-
-    /**
-     * Resolves one header array — which may freely mix Symfony's own two
-     * accepted forms, associative (`'Name' => 'value'` or `'Name' =>
-     * ['v1', 'v2']`) and numerically-indexed raw `"Name: value"` lines —
-     * into exactly one entry per lowercase header name:
-     * `['name' => <winning casing>, 'values' => <ordered value list>]`.
-     *
-     * Multiple *numeric-line* occurrences of the same name are a
-     * deliberately repeated header (there is no other reason to write
-     * the same name twice in raw-line form) and are combined into one
-     * ordered multi-value list, using the *last* occurrence's own
-     * casing as the winning spelling — consistent with every other
-     * "later wins" precedence in this class, applied here for the one
-     * remaining choice that needs to be made (which casing labels the
-     * combined list).
-     *
-     * Multiple *associative* occurrences of the same name (two different
-     * PHP keys — differently cased spellings of one HTTP field) are a
-     * same-array casing collision, not a repeat: the *last* occurrence
-     * wins outright, its own value(s) kept and every earlier occurrence
-     * for that name dropped — never combined, since re-interpreting
-     * several distinct associative entries as one intentional
-     * multi-value list would be assuming something the input never
-     * actually said.
-     *
-     * A name given via *both* forms within the same array — one
-     * associative entry and one raw line for what's nominally the same
-     * header — has no principled single resolution (which form's value
-     * should anchor the combined list?) and is rejected outright with a
-     * clear exception instead of guessing.
-     *
-     * A raw numeric-line entry's name is read the same way Symfony's own
-     * normalizeHeaders() reads it — explode() capped at the first colon
-     * only — so a value containing its own embedded colon (a URL, for
-     * instance) is never mistaken for part of the name. An entry that
-     * can't be understood as a header at all (a numeric key whose value
-     * isn't a "Name: value" string, or whose name portion is empty or
-     * all whitespace, e.g. ": value") is rejected here, clearly, rather
-     * than passed through to fail later with a vaguer error from
-     * Symfony's own normalization or a silent wrong split.
-     *
-     * @param array<array-key, mixed> $headers
-     * @return array<string, array{name: string, values: list<string>}>
-     */
-    private static function normalizeHeaderArray(array $headers): array
-    {
-        /** @var array<string, list<array{kind: 'associative'|'numeric', name: string, values: array<string>}>> $occurrences */
-        $occurrences = [];
-
-        foreach ($headers as $key => $value) {
-            if (is_int($key)) {
-                if (!is_string($value) || !str_contains($value, ':')) {
-                    throw new InvalidArgumentException(sprintf(
-                        'A numeric header entry must be a "Name: value" string; got %s.',
-                        get_debug_type($value),
-                    ));
-                }
-
-                [$name, $rest] = explode(':', $value, 2);
-                $name = trim($name);
-
-                if ($name === '') {
-                    throw new InvalidArgumentException(
-                        'A numeric header entry must not have an empty header name (e.g. ": value").',
-                    );
-                }
-
-                $occurrences[strtolower($name)][] = [
-                    'kind' => 'numeric',
-                    'name' => $name,
-                    'values' => [ltrim($rest)],
-                ];
-
-                continue;
-            }
-
-            /** @var mixed $value */
-            $values = is_iterable($value)
-                ? array_map(static fn (mixed $v): string => (string) $v, [...$value])
-                : [(string) $value];
-
-            $occurrences[strtolower($key)][] = [
-                'kind' => 'associative',
-                'name' => $key,
-                'values' => $values,
-            ];
-        }
-
-        return self::resolveHeaderOccurrences($occurrences);
-    }
-
-    /**
-     * @param array<string, list<array{kind: 'associative'|'numeric', name: string, values: array<string>}>> $occurrences
-     * @return array<string, array{name: string, values: list<string>}>
-     */
-    private static function resolveHeaderOccurrences(array $occurrences): array
-    {
-        $resolved = [];
-
-        foreach ($occurrences as $lowercaseName => $entries) {
-            $kinds = array_unique(array_column($entries, 'kind'));
-
-            if (count($kinds) > 1) {
-                throw new InvalidArgumentException(sprintf(
-                    'Header "%s" is given in both associative and raw "Name: value" line form within '
-                        . 'the same array — use only one form for a given header name.',
-                    $lowercaseName,
-                ));
-            }
-
-            if ($kinds === ['numeric']) {
-                $values = [];
-
-                foreach ($entries as $entry) {
-                    array_push($values, ...$entry['values']);
-                }
-
-                $resolved[$lowercaseName] = ['name' => $entries[count($entries) - 1]['name'], 'values' => $values];
-
-                continue;
-            }
-
-            // Associative: the last occurrence wins outright, its own
-            // value(s) kept as-is; every earlier occurrence for this
-            // name is dropped, never combined with it.
-            $winner = $entries[count($entries) - 1];
-            $resolved[$lowercaseName] = ['name' => $winner['name'], 'values' => array_values($winner['values'])];
-        }
-
-        return $resolved;
-    }
-
-    /**
-     * @param array<string, mixed> $options
-     */
-    private function withOptions(array $options): self
-    {
-        $clone = clone $this;
-        $clone->options = [...$this->options, ...$options];
-
-        return $clone;
-    }
-
-    private function sendingAsForm(bool $asForm): self
-    {
-        $clone = clone $this;
-        $clone->sendAsForm = $asForm;
-
-        return $clone;
+        return $flattened;
     }
 }

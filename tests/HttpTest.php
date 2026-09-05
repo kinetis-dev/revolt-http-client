@@ -4,32 +4,30 @@ declare(strict_types=1);
 
 namespace Kinetis\RevoltHttpClient\Tests;
 
-use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
-use Kinetis\RevoltHttpClient\AmpHttpClientFactory;
-use Kinetis\RevoltHttpClient\Http;
 use Fiber;
-use InvalidArgumentException;
+use Kinetis\RevoltHttpClient\AmpHttpClientFactory;
+use Kinetis\RevoltHttpClient\Exception\HttpFailure;
+use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
+use Kinetis\RevoltHttpClient\Http;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
-use Symfony\Component\HttpClient\MockHttpClient;
-use Symfony\Component\HttpClient\Response\MockResponse;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 /**
- * Against a real HTTP server, like this package's other test: what the
- * client claims to send is asserted from the server's own view of the
- * request, not from the client's internal state.
+ * Against a real HTTP server: what the client claims to send is asserted
+ * from the server's own view of the request, not from the client's
+ * internal state.
  *
  * Requests here run from plain top-level code — the same path a PHP-FPM
  * consumer without concurrently() takes — so this suite also pins that
- * HttpResponse's event-loop await keeps that path fast rather than
- * falling into Symfony's one-second transport poll tick.
+ * the event-loop await keeps that path fast rather than falling into
+ * Symfony's one-second transport poll tick.
  */
 final class HttpTest extends TestCase
 {
-    private const HOST = '127.0.0.1:8099';
-    private const BASE = 'http://127.0.0.1:8099';
+    private const string HOST = '127.0.0.1:8099';
+    private const string BASE = 'http://127.0.0.1:8099';
 
     /** @var resource */
     private static $serverProcess;
@@ -56,11 +54,8 @@ final class HttpTest extends TestCase
     /**
      * `php -S` gives no fixed readiness signal of its own — a real TCP
      * connect attempt, polled with a bounded deadline, in place of a
-     * fixed sleep that can race the server's own startup and lose on a
-     * slower or more loaded runner (this exact pattern, in a sibling
-     * fixture, caused a real failure under SonarQube Cloud's
-     * PCOV-instrumented coverage run — a genuine connection failure
-     * against a server that hadn't started listening yet).
+     * fixed sleep that races the server's own startup and loses it on a
+     * slower or more loaded runner.
      */
     private static function waitForServerReady(string $host): void
     {
@@ -86,9 +81,9 @@ final class HttpTest extends TestCase
      * connection pool, and against a keep-alive server that costs a new
      * connection per test for no added coverage.
      */
-    private function http(): Http
+    private function http(string $baseUrl = self::BASE): Http
     {
-        return new Http(self::$transport ??= AmpHttpClientFactory::create())->withBaseUrl(self::BASE);
+        return new Http(self::$transport ??= AmpHttpClientFactory::create())->withBaseUrl($baseUrl);
     }
 
     public function test_get_sends_the_method_path_and_query(): void
@@ -100,6 +95,28 @@ final class HttpTest extends TestCase
         self::assertSame('GET', $response->jsonPath('method'));
         self::assertSame('/orders', $response->jsonPath('path'));
         self::assertSame(['status' => 'open', 'page' => '2'], $response->jsonPath('query'));
+    }
+
+    /**
+     * @return iterable<string, array{base: string, target: string}>
+     */
+    public static function basePathJoinProvider(): iterable
+    {
+        yield 'no trailing slash, rooted target' => ['base' => self::BASE . '/v1', 'target' => '/orders'];
+        yield 'no trailing slash, bare target' => ['base' => self::BASE . '/v1', 'target' => 'orders'];
+        yield 'trailing slash, rooted target' => ['base' => self::BASE . '/v1/', 'target' => '/orders'];
+        yield 'trailing slash, bare target' => ['base' => self::BASE . '/v1/', 'target' => 'orders'];
+    }
+
+    /**
+     * A base path is a prefix that a relative target extends, never one
+     * a rooted target replaces — the same URL comes out whichever side
+     * carries the slash.
+     */
+    #[DataProvider('basePathJoinProvider')]
+    public function test_a_base_path_is_a_prefix_the_target_extends(string $base, string $target): void
+    {
+        self::assertSame('/v1/orders', $this->http($base)->get($target)->jsonPath('path'));
     }
 
     public function test_post_sends_a_json_body_by_default(): void
@@ -119,6 +136,16 @@ final class HttpTest extends TestCase
         self::assertSame('grant_type=client_credentials', $response->jsonPath('body'));
     }
 
+    public function test_a_caller_supplied_content_type_wins_over_the_encoding_default(): void
+    {
+        $response = $this->http()
+            ->withHeaders(['Content-Type' => 'application/vnd.api+json'])
+            ->post('/orders', ['sku' => 'A1']);
+
+        self::assertStringContainsString('application/vnd.api+json', (string) $response->jsonPath('contentType'));
+        self::assertSame('{"sku":"A1"}', $response->jsonPath('body'));
+    }
+
     public function test_put_patch_and_delete_reach_the_server(): void
     {
         self::assertSame('PUT', $this->http()->put('/orders/1', ['a' => 1])->jsonPath('method'));
@@ -131,6 +158,13 @@ final class HttpTest extends TestCase
         $response = $this->http()->withToken('secret-key')->get('/me');
 
         self::assertSame('Bearer secret-key', $response->jsonPath('headers.authorization'));
+    }
+
+    public function test_with_basic_auth_sets_an_authorization_header(): void
+    {
+        $response = $this->http()->withBasicAuth('user', 'pass')->get('/me');
+
+        self::assertSame('Basic ' . base64_encode('user:pass'), $response->jsonPath('headers.authorization'));
     }
 
     public function test_with_headers_accumulates_rather_than_replacing(): void
@@ -182,19 +216,6 @@ final class HttpTest extends TestCase
     }
 
     /**
-     * The original, identical-casing override behavior this fix must
-     * not disturb.
-     */
-    public function test_a_per_call_header_overrides_a_configured_one_of_the_same_case(): void
-    {
-        $response = $this->http()
-            ->withHeaders(['Authorization' => 'configured-value'])
-            ->send('GET', '/me', ['headers' => ['Authorization' => 'per-call-value']]);
-
-        self::assertSame('per-call-value', $response->jsonPath('headers.authorization'));
-    }
-
-    /**
      * A second withHeaders() call overrides the first for the same
      * header name, case-insensitively — chained client-level
      * configuration, not just a per-call override.
@@ -211,7 +232,7 @@ final class HttpTest extends TestCase
 
     /**
      * Overriding one header name must never disturb an unrelated one —
-     * genuinely different names simply accumulate.
+     * different names accumulate.
      */
     public function test_unrelated_headers_accumulate_across_configured_and_per_call(): void
     {
@@ -224,17 +245,13 @@ final class HttpTest extends TestCase
     }
 
     /**
-     * A header intentionally given several values for the same name
-     * (Symfony's own accepted `'Name' => ['v1', 'v2']` form) must send
-     * every value, not be collapsed to one by the case-insensitive
-     * merge — the merge only collapses *different* PHP array keys that
-     * name the *same* HTTP field case-insensitively, never a
-     * deliberately repeated single header. PHP's own SAPI joins
-     * genuinely repeated incoming header lines with ", " (RFC 7230
-     * §3.2.2), so the comma-joined value reaching the server is exactly
-     * what proves both lines were actually sent, not just one.
+     * A header given several values for the same name — the documented
+     * list form — sends every value. PHP's own SAPI joins repeated
+     * incoming header lines with ", " (RFC 9110), so the
+     * comma-joined value reaching the server is what proves both lines
+     * were sent, not just one.
      */
-    public function test_repeated_intentional_header_values_all_survive(): void
+    public function test_a_header_value_list_sends_every_value(): void
     {
         $response = $this->http()->send('GET', '/me', ['headers' => ['X-Custom' => ['first', 'second']]]);
 
@@ -242,12 +259,11 @@ final class HttpTest extends TestCase
     }
 
     /**
-     * `send()` accepts raw Symfony options, including the numerically-
-     * indexed "Name: value" line form for headers — a per-call override
-     * given this way must still deterministically win over a configured
-     * header given the ordinary associative form, for the same name.
+     * The raw `"Name: value"` line form is the other documented way to
+     * write a header; a per-call override given that way still wins over
+     * a configured associative one for the same name.
      */
-    public function test_a_numeric_line_per_call_header_overrides_a_configured_associative_one(): void
+    public function test_a_raw_line_per_call_header_overrides_a_configured_associative_one(): void
     {
         $response = $this->http()
             ->withHeaders(['Authorization' => 'configured-value'])
@@ -257,106 +273,15 @@ final class HttpTest extends TestCase
     }
 
     /**
-     * The header name is read up to only the *first* colon in a raw
-     * "Name: value" line, matching Symfony's own normalizeHeaders() —
-     * a value that itself contains a colon (a URL, here) must not be
-     * misread as part of the header name and must reach the server
-     * intact.
+     * The header name is read up to only the first colon, so a value
+     * that contains its own colon — a URL, here — reaches the server
+     * intact rather than being misread as part of the name.
      */
-    public function test_a_numeric_line_headers_value_may_contain_its_own_colon(): void
+    public function test_a_raw_line_headers_value_may_contain_its_own_colon(): void
     {
         $response = $this->http()->send('GET', '/me', ['headers' => [0 => 'X-Custom: http://example.com']]);
 
         self::assertSame('http://example.com', $response->jsonPath('headers.x-custom'));
-    }
-
-    /**
-     * A numeric header entry that isn't a real "Name: value" string
-     * can't be merged safely — rejected clearly here, rather than
-     * silently producing a wrong split or a vaguer failure from
-     * Symfony's own normalization further down the line.
-     */
-    public function test_a_malformed_numeric_header_entry_is_rejected_clearly(): void
-    {
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('A numeric header entry must be a "Name: value" string');
-
-        $this->http()->send('GET', '/me', ['headers' => [0 => 'NoColonHere']]);
-    }
-
-    /**
-     * Two *separate* numeric "Name: value" lines for the same header
-     * name, within one array, is how a deliberate repeat is expressed
-     * in raw-line form — both values must reach the server, not just
-     * whichever one Symfony's own per-entry-reset normalization would
-     * otherwise have kept. Confirmed via the real reflect-server rather
-     * than the merged array's own shape, so this actually proves the
-     * value on the wire, not just an intermediate representation.
-     */
-    public function test_two_numeric_lines_for_the_same_name_both_reach_the_server(): void
-    {
-        $response = $this->http()->send('GET', '/me', [
-            'headers' => [0 => 'X-Custom: first', 1 => 'X-Custom: second'],
-        ]);
-
-        self::assertSame('first, second', $response->jsonPath('headers.x-custom'));
-    }
-
-    /**
-     * Two *associative* case-variant keys for the same header name,
-     * within one array, is a same-array casing collision, not a
-     * deliberate repeat — the last occurrence must win outright, with
-     * only its own value reaching the server.
-     */
-    public function test_same_array_associative_case_variants_resolve_to_only_the_last_one(): void
-    {
-        $response = $this->http()->send('GET', '/me', [
-            'headers' => ['Authorization' => 'first', 'authorization' => 'second'],
-        ]);
-
-        self::assertSame('second', $response->jsonPath('headers.authorization'));
-    }
-
-    /**
-     * A header name given via *both* the associative and raw-line form
-     * within one array has no single principled resolution — rejected
-     * outright rather than arbitrarily preferring one form over the
-     * other.
-     */
-    public function test_mixing_associative_and_numeric_line_forms_for_the_same_name_is_rejected(): void
-    {
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage(
-            'Header "authorization" is given in both associative and raw "Name: value" line form',
-        );
-
-        $this->http()->send('GET', '/me', [
-            'headers' => ['Authorization' => 'assoc-value', 0 => 'authorization: raw-value'],
-        ]);
-    }
-
-    /**
-     * @return iterable<string, list<string>>
-     */
-    public static function emptyNumericHeaderNameProvider(): iterable
-    {
-        yield 'no name before the colon' => [': value'];
-        yield 'whitespace-only name before the colon' => ['   : value'];
-    }
-
-    /**
-     * A numeric line with nothing (or only whitespace) before the colon
-     * has no real header name — the colon-only check alone would accept
-     * this, so the name portion is validated separately after
-     * extraction.
-     */
-    #[DataProvider('emptyNumericHeaderNameProvider')]
-    public function test_a_numeric_header_entry_with_an_empty_name_is_rejected_clearly(string $line): void
-    {
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('must not have an empty header name');
-
-        $this->http()->send('GET', '/me', ['headers' => [0 => $line]]);
     }
 
     public function test_with_query_merges_into_every_request(): void
@@ -386,97 +311,47 @@ final class HttpTest extends TestCase
         self::assertSame('deliberate failure', $response->jsonPath('error'));
     }
 
-    public function test_throw_raises_on_an_error_status_and_names_the_request(): void
+    /**
+     * A 3xx is terminal: the client reports it and hands over the
+     * Location it was given, rather than reissuing the request — with
+     * this client's Authorization header on it — against whatever origin
+     * that header names.
+     */
+    public function test_a_redirect_is_a_terminal_response_rather_than_a_second_request(): void
     {
-        $this->expectException(HttpRequestException::class);
-        // getMessage() deliberately excludes the response body — see
-        // test_the_full_diagnostic_detail_is_reachable_but_not_in_getMessage()
-        // for where that detail actually lives.
-        $this->expectExceptionMessage('GET http://127.0.0.1:8099/status/500 returned HTTP 500.');
+        $response = $this->http()->withToken('secret-key')->get('/redirect');
 
-        $this->http()->get('/status/500')->throw();
+        self::assertSame(302, $response->status());
+        self::assertTrue($response->redirect());
+        self::assertSame('/me', $response->header('Location'));
+        self::assertTrue($response->jsonPath('redirected'));
     }
 
-    public function test_the_full_diagnostic_detail_is_reachable_but_not_in_getmessage(): void
+    public function test_throw_raises_on_an_error_status_and_names_only_method_origin_and_status(): void
     {
         try {
             $this->http()->get('/status/500')->throw();
             self::fail('Expected HttpRequestException.');
         } catch (HttpRequestException $e) {
+            self::assertSame(HttpFailure::ErrorStatus, $e->category);
+            self::assertSame(500, $e->status);
+            self::assertSame('GET http://127.0.0.1:8099 returned HTTP 500.', $e->getMessage());
+            self::assertStringNotContainsString('/status/500', $e->getMessage());
             self::assertStringNotContainsString('deliberate failure', $e->getMessage());
-            self::assertSame('http://127.0.0.1:8099/status/500', $e->diagnosticUrl());
-            self::assertSame('{"error":"deliberate failure"}', $e->diagnosticBody());
-            self::assertStringContainsString('deliberate failure', $e->diagnosticMessage());
-        }
-    }
-
-    public function test_getmessage_strips_userinfo_and_the_query_string_but_diagnostic_url_keeps_them(): void
-    {
-        $http = new Http(new MockHttpClient(
-            static fn (): MockResponse => new MockResponse('nope', ['http_code' => 403]),
-        ));
-
-        try {
-            $http->get('https://user:secret@api.example.com/orders?signature=abc123')->throw();
-            self::fail('Expected HttpRequestException.');
-        } catch (HttpRequestException $e) {
-            self::assertStringNotContainsString('secret', $e->getMessage());
-            self::assertStringNotContainsString('signature=abc123', $e->getMessage());
-            self::assertSame('GET https://api.example.com/orders returned HTTP 403.', $e->getMessage());
-            self::assertSame('https://user:secret@api.example.com/orders?signature=abc123', $e->diagnosticUrl());
         }
     }
 
     /**
-     * diagnosticUrl()/diagnosticBody() are private-backed accessor
-     * methods, not public properties — json_encode() (or any other
-     * implicit reflection over an object's public state, the way a
-     * generic structured-logging pipeline commonly serializes a caught
-     * exception) must never expose the raw URL or response body unless
-     * something explicitly calls those methods.
+     * The upstream's own error payload is where an API explains itself,
+     * and it is read from the response — the one place taking it is a
+     * decision — never from an exception that a log pipeline records by
+     * default.
      */
-    public function test_json_encoding_the_exception_never_exposes_the_raw_url_or_body(): void
+    public function test_the_error_body_stays_readable_on_the_response(): void
     {
-        $http = new Http(new MockHttpClient(
-            static fn (): MockResponse => new MockResponse('{"secret":"BODYSECRET"}', ['http_code' => 500]),
-        ));
+        $response = $this->http()->get('/status/500');
 
-        try {
-            $http->get('https://user:pass@example.test/orders?token=TOPSECRET')->throw();
-            self::fail('Expected HttpRequestException.');
-        } catch (HttpRequestException $e) {
-            $encoded = json_encode($e, JSON_THROW_ON_ERROR);
-
-            self::assertStringNotContainsString('TOPSECRET', $encoded);
-            self::assertStringNotContainsString('pass', $encoded);
-            self::assertStringNotContainsString('BODYSECRET', $encoded);
-            self::assertSame('{"status":500}', $encoded);
-        }
-    }
-
-    /**
-     * A real transport exception commonly names the URL it failed to
-     * reach, userinfo and all — copying $previous->getMessage() verbatim
-     * into this class's own message (the pre-fix behavior) would leak
-     * exactly the secret getMessage() elsewhere in this file is proven to
-     * redact. The full original message is still reachable, deliberately,
-     * via getPrevious().
-     */
-    public function test_a_transport_failures_own_message_never_leaks_into_getmessage(): void
-    {
-        $http = new Http(new MockHttpClient(static fn (): MockResponse => new MockResponse('', [
-            'error' => 'connect failed for https://user:pass@example.test/orders?token=TOPSECRET',
-        ])));
-
-        try {
-            $http->get('https://example.test/orders')->body();
-            self::fail('Expected HttpRequestException.');
-        } catch (HttpRequestException $e) {
-            self::assertStringNotContainsString('TOPSECRET', $e->getMessage());
-            self::assertStringNotContainsString('pass', $e->getMessage());
-            self::assertNotNull($e->getPrevious());
-            self::assertStringContainsString('TOPSECRET', $e->getPrevious()->getMessage());
-        }
+        self::assertSame('deliberate failure', $response->jsonPath('error'));
     }
 
     public function test_throw_returns_the_response_when_successful(): void
@@ -504,117 +379,16 @@ final class HttpTest extends TestCase
     }
 
     /**
-     * @return iterable<string, array{0: string, 1: string}>
+     * An id wider than PHP's own int type keeps every digit instead of
+     * being rounded into a float; an id that does fit stays an int, so
+     * the flag costs nothing for ordinary numbers.
      */
-    public static function scalarTopLevelJsonProvider(): iterable
+    public function test_an_integer_too_wide_for_php_is_decoded_as_a_string(): void
     {
-        yield 'string' => ['"a-secret-string-value"', 'string'];
-        yield 'integer' => ['123456789', 'int'];
-        yield 'float' => ['3.14159', 'float'];
-        yield 'true' => ['true', 'bool'];
-        yield 'false' => ['false', 'bool'];
-    }
+        $body = $this->http()->get('/big-int')->json();
 
-    /**
-     * A JSON string, number, or boolean is all syntactically valid JSON
-     * at the top level, so json_decode() never throws for any of these —
-     * distinct from test_a_non_json_body_fails_with_a_clear_error() above,
-     * which covers a body that fails to parse at all. Before this fix, a
-     * bare `return $decoded;` for one of these let PHP's own TypeError
-     * escape instead of this package's own documented exception.
-     * getMessage() reports only the decoded value's own type category —
-     * the same safe-by-default policy this class already applies to a
-     * response body/transport-failure message — never the raw value
-     * itself, which is only reachable via diagnosticBody().
-     */
-    #[DataProvider('scalarTopLevelJsonProvider')]
-    public function test_a_scalar_top_level_json_body_throws_a_clear_error_instead_of_a_type_error(
-        string $body,
-        string $expectedType,
-    ): void {
-        $http = new Http(new MockHttpClient(
-            static fn (): MockResponse => new MockResponse($body, ['http_code' => 200]),
-        ));
-
-        try {
-            $http->get('https://example.test/value')->json();
-
-            self::fail('Expected HttpRequestException.');
-        } catch (HttpRequestException $e) {
-            self::assertSame(200, $e->status);
-            self::assertStringNotContainsString($body, $e->getMessage());
-            self::assertStringContainsString($expectedType, $e->getMessage());
-            self::assertStringContainsString('not an object or array', $e->getMessage());
-            self::assertSame($body, $e->diagnosticBody());
-        }
-    }
-
-    /**
-     * A top-level JSON null is covered separately from the scalar
-     * provider above: its own decoded PHP type name ("null") and its raw
-     * JSON text ("null") are the identical string, so there's no separate
-     * "raw value" to prove absent from getMessage() the way there is for
-     * a string/number/boolean — only that the type is reported and the
-     * real body is still reachable via diagnosticBody().
-     */
-    public function test_a_top_level_json_null_throws_a_clear_error_instead_of_a_type_error(): void
-    {
-        $http = new Http(new MockHttpClient(
-            static fn (): MockResponse => new MockResponse('null', ['http_code' => 200]),
-        ));
-
-        try {
-            $http->get('https://example.test/value')->json();
-
-            self::fail('Expected HttpRequestException.');
-        } catch (HttpRequestException $e) {
-            self::assertSame(200, $e->status);
-            self::assertStringContainsString('null', $e->getMessage());
-            self::assertStringContainsString('not an object or array', $e->getMessage());
-            self::assertSame('null', $e->diagnosticBody());
-        }
-    }
-
-    /**
-     * jsonPath() calls json() internally — proving it fails with the same
-     * package exception (not a TypeError) for a scalar top-level body,
-     * rather than assuming the fix in json() propagates correctly.
-     */
-    public function test_json_path_fails_with_the_same_exception_for_a_scalar_top_level_body(): void
-    {
-        $http = new Http(new MockHttpClient(
-            static fn (): MockResponse => new MockResponse('"just a string"', ['http_code' => 200]),
-        ));
-
-        $this->expectException(HttpRequestException::class);
-        $this->expectExceptionMessage('not an object or array');
-        $http->get('https://example.test/value')->jsonPath('anything');
-    }
-
-    /**
-     * @return iterable<string, list<string>>
-     */
-    public static function emptyTopLevelJsonContainerProvider(): iterable
-    {
-        yield 'empty object' => ['{}'];
-        yield 'empty array' => ['[]'];
-    }
-
-    /**
-     * associative: true decodes both an empty JSON object and an empty
-     * JSON array to the identical empty PHP array — there's no way to
-     * tell them apart once decoded, and json()'s own array-oriented
-     * contract doesn't need to: both are valid, successful top-level
-     * containers, not the scalar/null case this fix rejects.
-     */
-    #[DataProvider('emptyTopLevelJsonContainerProvider')]
-    public function test_an_empty_top_level_json_container_decodes_successfully(string $body): void
-    {
-        $http = new Http(new MockHttpClient(
-            static fn (): MockResponse => new MockResponse($body, ['http_code' => 200]),
-        ));
-
-        self::assertSame([], $http->get('https://example.test/value')->json());
+        self::assertSame('12345678901234567890123', $body['id']);
+        self::assertSame(9007199254740993, $body['safe']);
     }
 
     public function test_the_body_is_read_once_and_reusable(): void
@@ -644,72 +418,200 @@ final class HttpTest extends TestCase
         self::assertNull($response->header('X-Absent'));
     }
 
-    public function test_retries_are_configurable_without_changing_behavior_on_success(): void
+    /**
+     * Discarding a real response releases it against a real connection
+     * and stays quiet about it; the pool behind this transport serves
+     * every later test in this class, which is what proves the release
+     * left it usable.
+     */
+    public function test_discarding_a_real_response_releases_it_and_leaves_the_client_usable(): void
     {
-        // The retry decorator wraps the transport; a successful request is
-        // unaffected, and the configured client keeps its own options.
+        $response = $this->http()->get('/orders');
+
+        self::assertSame(200, $response->status());
+
+        $response->discard();
+        $response->discard();
+
+        self::assertSame(200, $this->http()->get('/ok')->status());
+    }
+
+    /**
+     * A body exactly at the ceiling comes back whole, over a real
+     * transport and a real connection.
+     */
+    public function test_a_body_exactly_at_the_ceiling_comes_back_whole(): void
+    {
+        $response = $this->http()->withMaxResponseBytes(4096)->get('/bytes/4096');
+
+        self::assertSame(4096, strlen($response->body()));
+    }
+
+    /**
+     * A response whose declared length is past the ceiling is refused
+     * before the body is fetched.
+     */
+    public function test_a_declared_length_past_the_ceiling_is_refused(): void
+    {
+        $response = $this->http()->withMaxResponseBytes(1024)->get('/bytes/8192');
+
+        self::assertSame('8192', $response->header('Content-Length'));
+
+        $this->expectException(HttpRequestException::class);
+        $this->expectExceptionMessage('past the 1024-byte ceiling');
+        $response->body();
+    }
+
+    /**
+     * The server flushes this one as it goes, so there is no
+     * Content-Length to check and nothing to believe: the ceiling has to
+     * hold on the transfer itself, through the progress hook this client
+     * hands the real transport.
+     */
+    public function test_a_response_with_no_declared_length_is_bounded_by_the_transfer(): void
+    {
+        $response = $this->http()->withMaxResponseBytes(2048)->get('/stream/65536');
+
+        self::assertNull($response->header('Content-Length'));
+
+        try {
+            $response->body();
+
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            self::assertSame(HttpFailure::ResponseTooLarge, $e->category);
+        }
+
+        // The pool behind this transport serves every later test in this
+        // class, so a usable client afterwards is what proves the
+        // aborted transfer was cleaned up rather than left half-read.
+        self::assertSame(200, $this->http()->get('/ok')->status());
+    }
+
+    /**
+     * Every request asks for identity encoding, which is what makes the
+     * byte ceiling a bound on memory: with no Accept-Encoding of its own
+     * a Symfony response inflates a compressed body transparently, and a
+     * kilobyte off the wire becomes a megabyte held before anything can
+     * measure it.
+     */
+    public function test_every_request_asks_the_server_for_identity_encoding(): void
+    {
+        self::assertSame('identity', $this->http()->get('/me')->jsonPath('headers.accept-encoding'));
+    }
+
+    /**
+     * A megabyte that arrives as a kilobyte of gzip is a kilobyte held.
+     * The ceiling here is far below the decoded size and far above the
+     * wire size: the body comes back, and what came back is the
+     * compressed bytes, not the megabyte they stand for.
+     */
+    public function test_a_compressed_body_is_bounded_by_its_wire_size_rather_than_its_decoded_size(): void
+    {
+        $response = $this->http()->withMaxResponseBytes(64 * 1024)->get('/gzip/1048576');
+
+        self::assertSame('gzip', $response->header('Content-Encoding'));
+
+        $body = $response->body();
+
+        self::assertLessThanOrEqual(64 * 1024, strlen($body));
+        self::assertSame(1048576, strlen((string) gzdecode($body)));
+    }
+
+    /**
+     * @return iterable<string, array{0: int, 1: bool}>
+     */
+    public static function compressedCeilingProvider(): iterable
+    {
+        yield 'exactly at the wire size' => [0, true];
+        yield 'one byte under the wire size' => [-1, false];
+    }
+
+    /**
+     * The boundary is the bytes that arrived, compressed or not: exactly
+     * the ceiling passes, one byte over throws. The wire size is
+     * measured first rather than assumed, since it is gzip's to decide.
+     *
+     * @param int $offset added to the wire size to make the ceiling
+     */
+    #[DataProvider('compressedCeilingProvider')]
+    public function test_a_compressed_body_meets_the_ceiling_at_its_wire_size(int $offset, bool $passes): void
+    {
+        $wireSize = (int) $this->http()->get('/gzip/65536')->header('Content-Length');
+
+        self::assertGreaterThan(0, $wireSize);
+
+        $response = $this->http()->withMaxResponseBytes($wireSize + $offset)->get('/gzip/65536');
+
+        if ($passes) {
+            self::assertSame($wireSize, strlen($response->body()));
+
+            return;
+        }
+
+        try {
+            $response->body();
+
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            self::assertSame(HttpFailure::ResponseTooLarge, $e->category);
+        }
+    }
+
+    /**
+     * A megabyte behind a retrying client and a 512-byte ceiling, over a
+     * real transport: the refusal is the same whether the transport had
+     * already buffered past the ceiling while answering the status wait
+     * or only does so at the read. What is asserted here is the part
+     * that holds either way — a body past the ceiling is never returned,
+     * and the failure is the ceiling's rather than anything else's.
+     *
+     * Which of the two routes reports it is pinned deterministically in
+     * `HttpResponseSizeTest`, where the transport reports its own bytes
+     * instead of a real one being timed.
+     */
+    public function test_a_retrying_client_never_returns_a_compressed_body_past_the_ceiling(): void
+    {
+        try {
+            $body = $this->http()->withRetries(1)->withMaxResponseBytes(512)->get('/gzip/1048576')->body();
+
+            self::fail(sprintf('Expected HttpRequestException; %d bytes came back instead.', strlen($body)));
+        } catch (HttpRequestException $e) {
+            self::assertSame(HttpFailure::ResponseTooLarge, $e->category);
+        }
+    }
+
+    /**
+     * An error payload is untrusted data whether or not it is
+     * compressed, so the ceiling holds for the body a caller reads to
+     * find out what went wrong — and leaves a small one readable.
+     */
+    public function test_an_error_body_is_bounded_by_the_ceiling_and_a_small_one_still_reads(): void
+    {
+        $bounded = $this->http()->withMaxResponseBytes(8);
+
+        self::assertSame(500, $bounded->get('/status/500')->status());
+
+        try {
+            $bounded->get('/status/500')->body();
+
+            self::fail('Expected HttpRequestException.');
+        } catch (HttpRequestException $e) {
+            self::assertSame(HttpFailure::ResponseTooLarge, $e->category);
+        }
+
+        self::assertSame(
+            'deliberate failure',
+            $this->http()->withMaxResponseBytes(4096)->get('/status/500')->jsonPath('error'),
+        );
+    }
+
+    public function test_a_retrying_client_leaves_a_successful_request_alone(): void
+    {
         $response = $this->http()->withToken('secret-key')->withRetries(2)->get('/me');
 
         self::assertSame(200, $response->status());
         self::assertSame('Bearer secret-key', $response->jsonPath('headers.authorization'));
-    }
-
-    public function test_with_basic_auth_and_timeout_reach_the_transport(): void
-    {
-        // Asserted at the transport boundary via MockHttpClient's
-        // callback, which hands over the final resolved options — no
-        // server involved.
-        $seen = null;
-        $transport = new MockHttpClient(static function (string $method, string $url, array $options) use (&$seen): MockResponse {
-            $seen = $options;
-
-            return new MockResponse('{}');
-        });
-
-        new Http($transport)->withBasicAuth('user', 'pass')->withTimeout(7.5)->get('https://example.test/');
-
-        self::assertIsArray($seen);
-        self::assertSame(7.5, $seen['timeout']);
-        // Symfony normalizes auth_basic into the Authorization header.
-        self::assertContains('Authorization: Basic ' . base64_encode('user:pass'), $seen['headers']);
-    }
-
-    public function test_a_transport_failure_throws_the_same_exception_type(): void
-    {
-        $http = new Http(new MockHttpClient(static fn (): MockResponse => new MockResponse('', ['error' => 'connection refused'])));
-
-        $response = $http->get('https://unreachable.test/');
-
-        $this->expectException(HttpRequestException::class);
-        $this->expectExceptionMessage('GET https://unreachable.test/ failed before any response arrived');
-
-        $response->status();
-    }
-
-    public function test_a_transport_failure_reports_status_zero(): void
-    {
-        $http = new Http(new MockHttpClient(static fn (): MockResponse => new MockResponse('', ['error' => 'connection refused'])));
-
-        try {
-            $http->get('https://unreachable.test/')->body();
-            self::fail('Expected HttpRequestException.');
-        } catch (HttpRequestException $e) {
-            self::assertSame(0, $e->status);
-            self::assertNotNull($e->getPrevious());
-        }
-    }
-
-    public function test_it_accepts_a_mock_transport_for_tests(): void
-    {
-        // The documented way to test code that calls out over HTTP: swap
-        // the transport, touch no network.
-        $http = new Http(new MockHttpClient([
-            new MockResponse('{"id": 42}', ['http_code' => 200]),
-            new MockResponse('nope', ['http_code' => 503]),
-        ]));
-
-        self::assertSame(42, $http->get('https://example.test/orders/42')->jsonPath('id'));
-        self::assertTrue($http->get('https://example.test/orders/43')->serverError());
     }
 
     public function test_a_request_suspends_rather_than_blocking_the_process(): void
