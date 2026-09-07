@@ -151,10 +151,11 @@ final class Http
     {
         // Defaults through this package's own factory rather than
         // Symfony's class directly, so the Revolt-backed transport and
-        // its defaults stay defined in one place — and through the
-        // variant that adds no retry layer of its own beneath this
-        // client's, which is the whole of what "one retry layer" means.
-        $this->transport = Preflight::transport($transport) ?? AmpHttpClientFactory::createWithoutRetries();
+        // its defaults stay defined in one place — and that factory
+        // makes one wire attempt per request, so no retry layer sits
+        // beneath this client's, which is the whole of what "one retry
+        // layer" means.
+        $this->transport = Preflight::transport($transport) ?? AmpHttpClientFactory::create();
     }
 
     /**

@@ -83,10 +83,10 @@ on, and `throw()` opts into raising instead. Read the body with `json()`,
 `AmpHttpClientFactory::create()` returns the underlying Symfony
 `HttpClientInterface` on its own, for libraries that want to be handed a
 client. It is a plain Symfony client and a deliberate escape hatch: none
-of the guarantees above apply to it — redirect following and Symfony's
-own Amp-level request retries included. `createWithoutRetries()` is the
-same client with one wire attempt per request, which is what `Http`
-itself is built on.
+of the guarantees above apply to it, redirect following included. One
+thing carries across, and it is what `Http` itself is built on: one
+request is one wire attempt, so a library given this client retries on
+its own terms or not at all.
 
 ```php
 use Kinetis\RevoltHttpClient\AmpHttpClientFactory;
