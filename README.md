@@ -22,10 +22,10 @@ Part of [Kinetis](https://kinetis.dev/), a non-blocking PHP framework for
 API-first applications, developed in the
 [kinetis-dev/kinetis](https://github.com/kinetis-dev/kinetis) monorepo.
 
-Built for Kinetis, but usable in
-any PHP project — this package depends on nothing beyond
-`symfony/http-client` (and its `symfony/http-client-contracts`) and
-`amphp/http-client`. No [`kinetis/framework`](https://github.com/kinetis-dev/framework) required.
+Built for Kinetis, but usable in any PHP project — this package depends
+on nothing beyond `symfony/http-client` (and its
+`symfony/http-client-contracts`), `amphp/http-client`, and
+`revolt/event-loop`. No [`kinetis/framework`](https://github.com/kinetis-dev/framework) required.
 
 ```php
 use Kinetis\RevoltHttpClient\Http;
@@ -43,15 +43,12 @@ blocking the whole process — so several run at once through
 
 ## What it guarantees
 
-- **Every input is checked before a transport object exists.** The
-  transport, base URI, URL, method, headers, query, body, options,
-  timeout, retry count, and response-byte ceiling each have a shape this
-  client will send and one it refuses. A refused call reaches no network
-  at all.
 - **A credential is pinned to one origin.** A client carrying an
-  `Authorization`, `Cookie`, or `Proxy-Authorization` header requires
-  `withBaseUrl()`, and then every URL it accepts is relative to that
-  base. Another origin is another client.
+  `Authorization` or `Cookie` header requires `withBaseUrl()`, and then
+  every URL it accepts is relative to that base. Another origin is
+  another client. The validated URL alone names where a request goes:
+  `Host`, `Proxy-Authorization`, and `Accept-Encoding` are refused
+  wherever a caller writes them.
 - **Redirects are never followed.** A 3xx is a terminal response with a
   `Location` to read. Following one means deciding, per response,
   whether a new origin may see this client's `Authorization` header,
@@ -59,12 +56,11 @@ blocking the whole process — so several run at once through
   the credential is for.
 - **One retry layer, and one total deadline.** `withRetries()` is the
   only way to configure retries, the transport underneath makes one wire
-  attempt per request, a retrying transport is refused where it is
-  injected, a per-call retry option is refused rather than merged, and a
-  body that cannot be replayed is refused rather than resent.
-  `withTimeout()` bounds the whole operation on a monotonic clock —
-  every attempt, every backoff, and every read of the response — and is
-  enforced here rather than trusted to the transport.
+  attempt per request, a per-call retry option is refused rather than
+  merged, and a body that cannot be replayed is refused rather than
+  resent. `withTimeout()` bounds the whole operation on a monotonic
+  clock — every attempt, every backoff, and every read of the
+  response — and is enforced here rather than trusted to the transport.
 - **A bounded response.** `withMaxResponseBytes()` is the ceiling a body
   may reach, enforced while it arrives rather than once it is already in
   memory. Every request asks for identity encoding, so the bytes counted
@@ -82,8 +78,8 @@ on, and `throw()` opts into raising instead. Read the body with `json()`,
 
 `AmpHttpClientFactory::create()` returns the underlying Symfony
 `HttpClientInterface` on its own, for libraries that want to be handed a
-client. It is a plain Symfony client and a deliberate escape hatch: none
-of the guarantees above apply to it, redirect following included. One
+client. It is a plain Symfony client and the escape hatch: none of the
+guarantees above apply to it, redirect following included. One
 thing carries across, and it is what `Http` itself is built on: one
 request is one wire attempt, so a library given this client retries on
 its own terms or not at all.

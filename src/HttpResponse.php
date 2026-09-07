@@ -7,50 +7,22 @@ namespace Kinetis\RevoltHttpClient;
 use Closure;
 use JsonException;
 use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
+use Revolt\EventLoop;
 use SensitiveParameter;
 use Symfony\Contracts\HttpClient\ResponseInterface;
 use Throwable;
 
 /**
- * What {@see Http}'s verb methods return: the response, with the reading
- * and status handling a caller would otherwise write every time.
+ * What {@see Http}'s verb methods return. An error status is an answer
+ * here, not an exception; {@see throw()} opts into the other behavior.
+ * Reading is deferred until something asks for the body, status, or
+ * headers, which is what lets requests started inside
+ * `Kinetis\Async\concurrently()` overlap.
  *
- * An error status is not an exception here. `$response->failed()` and
- * `$response->status()` are answers, and {@see throw()} is how a caller
- * opts into the other behavior — a 404 from an API you are probing is
- * information, not a crash, and which one it is belongs to the caller
- * rather than the client. A 3xx is an answer too: redirects are never
- * followed, so `status()` reports the redirect and `header('Location')`
- * is there to read.
- *
- * Reading is deferred until something asks for the body,
- * status, or headers, which is what lets several requests started inside
- * `Kinetis\Async\concurrently()` overlap rather than complete one at a
- * time.
- *
- * **The deadline reaches here.** The budget {@see Http::withTimeout()}
- * sets covers this object too: a read is refused once the operation's
- * monotonic deadline has passed, with the `Timeout` category, and a read
- * that fails after it has passed reports the timeout rather than the
- * transport. A transport that ignores the per-request duration it was
- * given and blocks inside a single read cannot be interrupted from here;
- * the deadline is checked at every boundary this package controls.
- *
- * **Ownership.** This object owns the underlying transport response for
- * as long as it lives. {@see discard()} is how a caller gives it back
- * early and deterministically: it releases the body, never throws, never
- * blocks on the network, and can be called any number of times,
- * including after a full read. A read after it fails with the
- * `Discarded` category rather than returning something undefined. A
- * response nobody discards releases the same way when PHP collects the
- * object — the fallback that keeps an abandoned response from holding a
- * connection, not the API to reach for, since when a collection happens
- * is PHP's decision and not the caller's.
- *
- * A transport failure — DNS, a refused connection, a timeout — has no
- * status to return, so it throws {@see HttpRequestException} (with
- * status 0) from whichever read method first needs the response. One
- * exception type covers everything this client throws.
+ * This object owns the underlying transport response for as long as it
+ * lives, and releases it on {@see discard()}, on a full read, and on
+ * collection. The operation's deadline reaches every read: one refused
+ * before it and one that answers after it both report the timeout.
  */
 final class HttpResponse
 {
@@ -67,24 +39,16 @@ final class HttpResponse
 
     /**
      * The fallback for a response nobody read and nobody discarded.
-     * Releasing here rather than nowhere is what keeps an ignored
-     * response from holding its connection for as long as the object
-     * happens to live; {@see discard()} remains the way to release one
-     * at a chosen moment. Cancelling is local, so this neither blocks
-     * nor throws — a destructor that raised would raise from wherever
-     * PHP chose to collect, which is nowhere a caller can catch it.
+     * Cancelling is local, so this neither blocks nor throws: a
+     * destructor that raised would raise from wherever PHP chose to
+     * collect, which is nowhere a caller can catch it.
      */
     public function __destruct()
     {
-        if (!$this->released) {
-            self::release($this->response);
-        }
+        $this->releaseOnce();
     }
 
-    /**
-     * @throws HttpRequestException when no response arrived at all — see
-     *     the class note on transport failures.
-     */
+    /** @throws HttpRequestException when no response arrived at all. */
     public function status(): int
     {
         return $this->read($this->response->getStatusCode(...));
@@ -126,25 +90,11 @@ final class HttpResponse
     }
 
     /**
-     * The raw body, bounded by the ceiling
-     * {@see Http::withMaxResponseBytes()} sets. Read once and kept, so
-     * calling this and {@see json()} together doesn't fetch twice.
-     *
-     * The ceiling is checked at all three points a body can pass it, so
-     * that no path ends with the whole of an untrusted reply in memory:
-     *
-     * - a `Content-Length` larger than the ceiling fails before any body
-     *   is fetched;
-     * - a transfer that passes the ceiling as it arrives is aborted
-     *   there, which is what covers a response that declares no length
-     *   or declares one it exceeds;
-     * - what did arrive is measured before it is handed back, so a
-     *   transport that ignored the progress hook is caught by the one
-     *   check that needs nothing from it.
-     *
-     * Exactly the ceiling is a body like any other; one byte past it
-     * throws with the `ResponseTooLarge` category, and the response is
-     * released rather than left holding a connection nothing will read.
+     * The raw body, read once and kept, bounded by the ceiling
+     * {@see Http::withMaxResponseBytes()} sets at all three points a body
+     * can pass it — a `Content-Length` past it, the transfer itself, and
+     * the bytes that arrived — so no path ends with the whole of an
+     * untrusted reply in memory.
      */
     public function body(): string
     {
@@ -177,17 +127,10 @@ final class HttpResponse
     }
 
     /**
-     * The decoded JSON body as an array — a JSON object or array, per
-     * this method's own return type. A body that fails to parse throws
-     * with the `Conversion` category; so does one that parses into a
-     * bare JSON string, number, boolean, or null, all valid JSON and
-     * none of them something this method's array-shaped contract can
-     * return.
-     *
-     * An integer too large for PHP's own int type is decoded as a string
-     * rather than silently becoming a float: an API that keys resources
-     * by 64-bit ids, or by ids beyond JavaScript's safe integer range,
-     * gets its digits back exactly as they were sent.
+     * The decoded JSON body as an array. A body that fails to parse, and
+     * one that parses into a bare string, number, boolean or null, both
+     * throw with the `Conversion` category. An integer too large for
+     * PHP's own int type is decoded as a string rather than a float.
      *
      * @return array<array-key, mixed>
      */
@@ -198,15 +141,12 @@ final class HttpResponse
         try {
             $decoded = json_decode($body, associative: true, flags: JSON_THROW_ON_ERROR | JSON_BIGINT_AS_STRING);
         } catch (JsonException) {
-            throw HttpRequestException::malformedJson($this->budget->method, $this->budget->origin, $this->status());
+            throw $this->conversionFailed('a body that is not valid JSON');
         }
 
         if (!is_array($decoded)) {
-            throw HttpRequestException::unexpectedJsonType(
-                $this->budget->method,
-                $this->budget->origin,
-                $this->status(),
-                get_debug_type($decoded),
+            throw $this->conversionFailed(
+                'a JSON body that decoded to a ' . get_debug_type($decoded) . ', not an object or array',
             );
         }
 
@@ -247,19 +187,10 @@ final class HttpResponse
     }
 
     /**
-     * Throws when the status is not 2xx, and returns $this otherwise, so
-     * it chains onto a call whose failure should stop the caller:
-     *
-     *     $order = $http->get('/orders/1')->throw()->json();
-     *
-     * The exception names the method, the origin, and the status. The
-     * response body is not in it and never will be — an upstream error
-     * payload carries whatever the upstream chose to put there. Read it
-     * from this object, where taking it is a decision:
-     *
-     *     if ($response->failed()) {
-     *         $log->warning('upstream said', ['body' => $response->body()]);
-     *     }
+     * Throws when the status is not 2xx and returns $this otherwise, so
+     * it chains. The exception names the method, the origin, and the
+     * status; the upstream's error payload stays on this object, where
+     * reading it is a decision.
      */
     public function throw(): self
     {
@@ -272,14 +203,9 @@ final class HttpResponse
 
     /**
      * Releases the response body without reading it — the explicit end
-     * of this object's ownership, for a response whose status was all
-     * the caller wanted.
-     *
-     * It never throws and never blocks: cancelling is a local operation,
-     * and a transport that raises while being cancelled has nothing left
-     * to tell a caller who already said they were done. Calling it again
-     * does nothing; every read after it fails with the `Discarded`
-     * category, an earlier full read included.
+     * of this object's ownership. It never throws and never blocks, and
+     * calling it again does nothing; every read after it fails with the
+     * `Discarded` category, an earlier full read included.
      */
     public function discard(): void
     {
@@ -289,31 +215,13 @@ final class HttpResponse
     }
 
     /**
-     * Cancels a response nothing will read again. Shared with
-     * {@see Http}'s retry loop, which abandons a response every time it
-     * decides to send the request again; an abandoned response that kept
-     * its connection would leak one per retry.
-     *
-     * @internal
-     */
-    public static function release(ResponseInterface $response): void
-    {
-        try {
-            $response->cancel();
-        } catch (Throwable) {
-            // Nothing to report and nobody to report it to: the caller
-            // has already given the response up.
-        }
-    }
-
-    /**
-     * Every read goes through here, so a vendor exception becomes this
-     * package's own typed failure in one place rather than in each
-     * method — and so does a read of a response that was given back, one
-     * past the operation's deadline, and one the byte ceiling stopped.
-     * Anything the transport raises is replaced rather than wrapped: a
-     * transport exception routinely names the URI it failed on,
-     * userinfo and all.
+     * Every read goes through here, so one place covers a read of a
+     * response that was given back, one past the deadline, and one the
+     * byte ceiling stopped. What the transport raises is replaced rather
+     * than wrapped: its message routinely names the URI it failed on.
+     * Which failure it becomes is read from the budget's state, never
+     * from the exception's type, so a progress-guard failure the
+     * transport wrapped is still the ceiling or the deadline it was.
      *
      * @template T
      * @param Closure(): T $read
@@ -323,39 +231,85 @@ final class HttpResponse
     {
         $this->guardNotDiscarded();
 
-        if ($this->budget->deadline->expired()) {
+        if ($this->budget->expired()) {
             $this->releaseOnce();
 
             throw $this->budget->timedOut();
         }
 
         try {
-            $value = Loop::await($read);
+            $value = self::await($read);
         } catch (Throwable) {
             $this->releaseOnce();
 
             throw match (true) {
-                // The ceiling is asked first: passing it is what made the
-                // transport raise, and the transport's own account of that
-                // is the one thing this package will not repeat.
-                $this->budget->exceeded => $this->tooLarge(),
-                $this->budget->deadline->expired() => $this->budget->timedOut(),
+                $this->budget->exceeded => $this->budget->tooLarge(),
+                $this->budget->expired() => $this->budget->timedOut(),
                 default => $this->budget->transportFailure(),
             };
         }
 
         // A read that answered after the budget ran out spent it just as
-        // surely as one that never answered. A transport that ignores
-        // the duration it is handed can only be caught here, on the way
-        // back, so the answer is refused rather than returned from an
-        // operation that is already over.
-        if ($this->budget->deadline->expired()) {
+        // surely as one that never answered. A transport ignoring the
+        // duration it was handed can only be caught here, on the way
+        // back.
+        if ($this->budget->expired()) {
             $this->releaseOnce();
 
             throw $this->budget->timedOut();
         }
 
         return $value;
+    }
+
+    /**
+     * Runs one read on the event loop and waits for it, so the calling
+     * Fiber suspends rather than the process blocking. From plain
+     * top-level code Symfony's response stream polls once a second;
+     * inside a fiber the loop keeps turning and the same read completes
+     * in milliseconds.
+     *
+     * @template T
+     * @param Closure(): T $work
+     * @return T
+     */
+    private static function await(#[SensitiveParameter] Closure $work): mixed
+    {
+        $suspension = EventLoop::getSuspension();
+        $result = null;
+        $error = null;
+
+        EventLoop::queue(static function () use ($work, $suspension, &$result, &$error): void {
+            try {
+                $result = $work();
+            } catch (Throwable $e) {
+                $error = $e;
+            }
+
+            $suspension->resume();
+        });
+
+        $suspension->suspend();
+
+        if ($error !== null) {
+            throw $error;
+        }
+
+        // The queued fiber ran to completion before the suspension
+        // resumed, so exactly one of $error/$result is set by now.
+        /** @var T $result */
+        return $result;
+    }
+
+    /** $problem is fixed text; the body it describes is never quoted. */
+    private function conversionFailed(string $problem): HttpRequestException
+    {
+        return HttpRequestException::conversionFailed(
+            $this->budget->method,
+            $this->budget->origin,
+            $this->status(),
+            $problem,
+        );
     }
 
     /** A fresh failure for the ceiling, and no more reads of a body that passed it. */
@@ -374,7 +328,12 @@ final class HttpResponse
 
         $this->released = true;
 
-        self::release($this->response);
+        try {
+            $this->response->cancel();
+        } catch (Throwable) {
+            // Nothing to report and nobody to report it to: the caller
+            // has already given the response up.
+        }
     }
 
     private function guardNotDiscarded(): void

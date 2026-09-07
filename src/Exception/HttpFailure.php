@@ -5,24 +5,21 @@ declare(strict_types=1);
 namespace Kinetis\RevoltHttpClient\Exception;
 
 /**
- * The fixed set of categories {@see HttpRequestException} reports.
- *
- * A category is the whole machine-readable answer to "what went wrong":
- * it is chosen from this list at the point of failure, never derived from
- * a vendor exception's class or message, so no lower-level library's own
- * wording can reach a caller through it. Branch on the category rather
- * than on `getMessage()`, which is prose and carries only the request
- * method, the validated origin, and a status.
+ * The fixed set of categories {@see HttpRequestException} reports, chosen
+ * at the point of failure and never derived from a vendor exception's
+ * class or message. Branch on the category rather than on
+ * `getMessage()`, which is prose.
  */
 enum HttpFailure: string
 {
-    /** A client built with input this package refuses to send. */
-    case InvalidConfiguration = 'invalid-configuration';
-
-    /** A per-call URL, header, query, body, or option this package refuses to send. */
+    /**
+     * A client, a call, or a body this package refuses to send, the
+     * transport's own refusal to construct a request included. Nothing
+     * reached the network, and a repeat would refuse the same way.
+     */
     case InvalidRequest = 'invalid-request';
 
-    /** Encoding a body, or reading a response as JSON, failed. */
+    /** Reading a response as JSON failed. */
     case Conversion = 'conversion';
 
     /** No response arrived: DNS, a refused connection, a dropped socket. */
@@ -34,9 +31,9 @@ enum HttpFailure: string
     /** The response body passed the ceiling the client allows it. */
     case ResponseTooLarge = 'response-too-large';
 
-    /** A response arrived, and {@see HttpRequestException::errorStatus()} was asked to treat it as a failure. */
+    /** A response arrived, and `HttpResponse::throw()` was asked to raise on it. */
     case ErrorStatus = 'error-status';
 
-    /** A method was called on a response whose body had already been released. */
+    /** A read was attempted on a response whose body had already been released. */
     case Discarded = 'discarded';
 }

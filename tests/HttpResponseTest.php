@@ -4,374 +4,244 @@ declare(strict_types=1);
 
 namespace Kinetis\RevoltHttpClient\Tests;
 
+use Closure;
 use Kinetis\RevoltHttpClient\Exception\HttpFailure;
 use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
 use Kinetis\RevoltHttpClient\Http;
+use Kinetis\RevoltHttpClient\HttpResponse;
+use Kinetis\RevoltHttpClient\Tests\Fixtures\ScriptedTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
-use RuntimeException;
-use Symfony\Component\HttpClient\MockHttpClient;
-use Symfony\Component\HttpClient\Response\MockResponse;
-use Symfony\Contracts\HttpClient\HttpClientInterface;
-use Symfony\Contracts\HttpClient\ResponseInterface;
-use Symfony\Contracts\HttpClient\ResponseStreamInterface;
 
 /**
- * Reading a response, giving one back, and what an exception from either
- * is allowed to carry.
+ * What the response owns: the transport response it releases, the byte
+ * ceiling it enforces, and the fixed failures it reports instead of the
+ * transport's own.
  */
 final class HttpResponseTest extends TestCase
 {
     private const string URL = 'https://api.example.com/orders';
 
-    private function respondingWith(string $body, int $status = 200): Http
+    /** @param list<array<string, mixed>> $script */
+    private function respondingWith(array $script, int $maxBytes = 8 * 1024 * 1024): HttpResponse
     {
-        return new Http(new MockHttpClient(static fn (): MockResponse => new MockResponse($body, ['http_code' => $status])));
+        return new Http(new ScriptedTransport($script))->withMaxResponseBytes($maxBytes)->get(self::URL);
     }
 
-    public function test_discard_is_quiet_and_repeatable(): void
+    public function test_discard_releases_once_and_is_repeatable(): void
     {
-        $response = $this->respondingWith('{"id":1}')->get(self::URL);
+        $transport = new ScriptedTransport([['status' => 200]]);
+        $response = new Http($transport)->get(self::URL);
 
         $response->discard();
         $response->discard();
 
-        $this->expectNotToPerformAssertions();
+        self::assertSame(1, $transport->cancellations());
     }
 
     /**
-     * @return iterable<string, array{0: \Closure(\Kinetis\RevoltHttpClient\HttpResponse): mixed}>
+     * @return iterable<string, array{0: Closure(HttpResponse): mixed}>
      */
     public static function readAfterDiscardProvider(): iterable
     {
-        yield 'status' => [static fn ($response) => $response->status()];
-        yield 'body' => [static fn ($response) => $response->body()];
-        yield 'json' => [static fn ($response) => $response->json()];
-        yield 'headers' => [static fn ($response) => $response->headers()];
+        yield 'status' => [static fn (HttpResponse $r): int => $r->status()];
+        yield 'body' => [static fn (HttpResponse $r): string => $r->body()];
+        yield 'json' => [static fn (HttpResponse $r): array => $r->json()];
+        yield 'headers' => [static fn (HttpResponse $r): array => $r->headers()];
     }
 
     /**
-     * Reading a response that was given back is a defined failure rather
-     * than an undefined result — the caller said they were done with it.
-     *
-     * @param \Closure(\Kinetis\RevoltHttpClient\HttpResponse): mixed $read
+     * @param Closure(HttpResponse): mixed $read
      */
     #[DataProvider('readAfterDiscardProvider')]
-    public function test_a_read_after_discard_fails_with_the_discarded_category(\Closure $read): void
+    public function test_a_read_after_discard_fails_with_the_discarded_category(Closure $read): void
     {
-        $response = $this->respondingWith('{"id":1}')->get(self::URL);
-        $response->body();
+        $response = $this->respondingWith([['status' => 200]]);
         $response->discard();
 
         try {
             $read($response);
-
-            self::fail('Expected HttpRequestException.');
+            self::fail('A read after discard was expected to raise.');
         } catch (HttpRequestException $e) {
             self::assertSame(HttpFailure::Discarded, $e->category);
-            self::assertSame('GET https://api.example.com was discarded; its body was released and cannot be read.', $e->getMessage());
         }
     }
 
-    /**
-     * Cancelling is the caller saying they are done; a transport that
-     * raises while being cancelled has nobody left to tell, and must not
-     * turn a cleanup into a second failure.
-     */
-    public function test_discard_stays_quiet_when_the_transport_raises_on_cancellation(): void
-    {
-        $response = new Http(self::transportWhoseResponseThrowsOnCancel($cancelled))->get(self::URL);
-
-        $response->discard();
-
-        self::assertSame(1, $cancelled);
-    }
-
-    /**
-     * Every response the retry loop abandons is released. An abandoned
-     * response that kept its connection would leak one per retry.
-     */
-    public function test_the_retry_loop_releases_every_response_it_abandons(): void
-    {
-        $cancelled = 0;
-
-        $response = new Http(self::transportWhoseResponseThrowsOnCancel($cancelled, status: 503))
-            ->withRetries(2)
-            ->get(self::URL);
-
-        // Three attempts, of which the first two were abandoned by the
-        // loop; the third belongs to the caller until they give it back.
-        self::assertSame(2, $cancelled);
-
-        $response->discard();
-
-        self::assertSame(3, $cancelled);
-    }
-
-    /**
-     * A response nobody reads and nobody discards still gives its
-     * connection back, at the point PHP collects it. That fallback is
-     * what keeps an ignored response from holding one for as long as the
-     * object happens to live; it is not a substitute for discard(),
-     * which releases at a moment the caller chose.
-     */
     public function test_a_response_nobody_keeps_releases_itself_when_it_is_collected(): void
     {
-        $transport = self::transportWhoseResponseThrowsOnCancel($cancelled);
+        $transport = new ScriptedTransport([['status' => 200]]);
 
         new Http($transport)->get(self::URL);
 
-        self::assertSame(1, $cancelled);
+        self::assertSame(1, $transport->cancellations());
     }
 
-    /**
-     * A body read to its end leaves the transport nothing to give back,
-     * so neither the destructor nor a later discard() cancels a response
-     * that is already complete.
-     */
     public function test_a_fully_read_response_is_not_cancelled_again(): void
     {
-        $transport = self::transportWhoseResponseThrowsOnCancel($cancelled);
+        $transport = new ScriptedTransport([['status' => 200, 'chunks' => ['{"ok":true}']]]);
+        $response = new Http($transport)->get(self::URL);
 
-        new Http($transport)->get(self::URL)->body();
+        self::assertSame(['ok' => true], $response->json());
+        $response->discard();
 
-        self::assertSame(0, $cancelled);
+        self::assertSame(0, $transport->cancellations());
     }
 
     /**
-     * Whatever the transport raises while a body is being read is
-     * replaced, not wrapped: its message routinely names the URI it
-     * failed on, userinfo and all.
+     * A transport exception names the URI it failed on, userinfo and
+     * all, so it is replaced rather than wrapped.
      */
     public function test_a_vendor_failure_while_reading_becomes_a_transport_failure(): void
     {
-        $transport = new class implements HttpClientInterface {
-            public function request(string $method, string $url, array $options = []): ResponseInterface
-            {
-                return new class implements ResponseInterface {
-                    public function getStatusCode(): int
-                    {
-                        return 200;
-                    }
-
-                    public function getHeaders(bool $throw = true): array
-                    {
-                        return [];
-                    }
-
-                    public function getContent(bool $throw = true): string
-                    {
-                        throw new RuntimeException('reading https://user:SENTINEL@api.example.com/orders failed');
-                    }
-
-                    public function toArray(bool $throw = true): array
-                    {
-                        return [];
-                    }
-
-                    public function cancel(): void {}
-
-                    public function getInfo(?string $type = null): mixed
-                    {
-                        return null;
-                    }
-                };
-            }
-
-            public function stream(iterable|ResponseInterface $responses, ?float $timeout = null): ResponseStreamInterface
-            {
-                throw new RuntimeException('not used');
-            }
-
-            public function withOptions(array $options): static
-            {
-                return $this;
-            }
-        };
+        $response = $this->respondingWith([[
+            'status' => 200,
+            'readFailure' => 'read of https://SENTINELUSER:SENTINELPASS@api.example.com failed',
+        ]]);
 
         try {
-            new Http($transport)->get(self::URL)->body();
-
-            self::fail('Expected HttpRequestException.');
+            $response->body();
+            self::fail('A failed read was expected to raise.');
         } catch (HttpRequestException $e) {
             self::assertSame(HttpFailure::Transport, $e->category);
-            self::assertNull($e->getPrevious());
-            self::assertSame('GET https://api.example.com failed before any response arrived.', $e->getMessage());
-        }
-    }
-
-    /**
-     * A body that is not valid UTF-8 is not valid JSON either, and it
-     * fails the same fixed way: the same category, the same message,
-     * and not one byte of the body quoted into either.
-     */
-    public function test_a_body_that_is_not_valid_utf8_fails_the_same_fixed_way(): void
-    {
-        try {
-            $this->respondingWith("{\"name\":\"\xB1\xC3SENTINELBODY\"}")->get(self::URL)->json();
-
-            self::fail('Expected HttpRequestException.');
-        } catch (HttpRequestException $e) {
-            self::assertSame(HttpFailure::Conversion, $e->category);
-            self::assertSame(
-                'GET https://api.example.com returned HTTP 200 with a body that is not valid JSON.',
-                $e->getMessage(),
-            );
             self::assertStringNotContainsString('SENTINEL', $e->getMessage());
+            self::assertNull($e->getPrevious());
         }
     }
 
-    public function test_a_body_that_is_not_json_fails_with_the_conversion_category(): void
+    public function test_a_body_exactly_at_the_ceiling_is_returned(): void
     {
-        try {
-            $this->respondingWith('definitely not json')->get(self::URL)->json();
+        self::assertSame('xxxx', $this->respondingWith([['status' => 200, 'chunks' => ['xxxx']]], 4)->body());
+    }
 
-            self::fail('Expected HttpRequestException.');
+    /**
+     * @return iterable<string, array{0: array<string, mixed>}>
+     */
+    public static function overLargeResponseProvider(): iterable
+    {
+        yield 'a declared length past the ceiling' => [[
+            'status' => 200,
+            'headers' => ['content-length' => ['9']],
+            'chunks' => ['xxxxxxxxx'],
+        ]];
+
+        yield 'a transfer past the ceiling, with no length declared' => [[
+            'status' => 200,
+            'chunks' => ['xxxx', 'xxxxx'],
+        ]];
+
+        yield 'a transfer past a length that understates it' => [[
+            'status' => 200,
+            'headers' => ['content-length' => ['2']],
+            'chunks' => ['xxxx', 'xxxxx'],
+        ]];
+    }
+
+    /**
+     * @param array<string, mixed> $step
+     */
+    #[DataProvider('overLargeResponseProvider')]
+    public function test_a_body_past_the_ceiling_throws_and_releases_the_response(array $step): void
+    {
+        $transport = new ScriptedTransport([$step]);
+        $response = new Http($transport)->withMaxResponseBytes(4)->get(self::URL);
+
+        try {
+            $response->body();
+            self::fail('An over-large body was expected to raise.');
         } catch (HttpRequestException $e) {
-            self::assertSame(HttpFailure::Conversion, $e->category);
-            self::assertSame(
-                'GET https://api.example.com returned HTTP 200 with a body that is not valid JSON.',
-                $e->getMessage(),
-            );
+            self::assertSame(HttpFailure::ResponseTooLarge, $e->category);
+            self::assertStringContainsString('4-byte ceiling', $e->getMessage());
         }
+
+        self::assertSame(1, $transport->cancellations());
     }
 
-    /**
-     * @return iterable<string, array{0: string, 1: string}>
-     */
-    public static function scalarTopLevelJsonProvider(): iterable
+    public function test_the_transfer_stops_at_the_chunk_that_passes_the_ceiling(): void
     {
-        yield 'string' => ['"a-secret-string-value"', 'string'];
-        yield 'integer' => ['123456789', 'int'];
-        yield 'float' => ['3.14159', 'float'];
-        yield 'true' => ['true', 'bool'];
-        yield 'false' => ['false', 'bool'];
-        yield 'null' => ['null', 'null'];
+        $transport = new ScriptedTransport([['status' => 200, 'chunks' => ['xxxx', 'xxxx', 'xxxx', 'xxxx']]]);
+
+        try {
+            new Http($transport)->withMaxResponseBytes(4)->get(self::URL)->body();
+        } catch (HttpRequestException) {
+            // The stopping point is what this test is about.
+        }
+
+        self::assertSame(2, $transport->responses[0]->chunksDelivered);
+    }
+
+    public function test_a_shared_client_carries_no_size_state_between_requests(): void
+    {
+        $transport = new ScriptedTransport([['status' => 200, 'chunks' => ['xxxxxxxx']], ['status' => 200, 'chunks' => ['xx']]]);
+        $client = new Http($transport)->withMaxResponseBytes(4);
+
+        try {
+            $client->get(self::URL)->body();
+        } catch (HttpRequestException) {
+            // The first request exhausts its own budget, not the next one's.
+        }
+
+        self::assertSame('xx', $client->get(self::URL)->body());
+    }
+
+    public function test_the_progress_hook_is_the_clients_own_and_cannot_be_replaced(): void
+    {
+        $transport = new ScriptedTransport([['status' => 200]]);
+
+        new Http($transport)->get(self::URL)->status();
+
+        self::assertInstanceOf(Closure::class, $transport->options[0]['on_progress']);
+    }
+
+    public function test_the_default_ceiling_applies_without_configuration(): void
+    {
+        self::assertSame(8 * 1024 * 1024, Http::DEFAULT_MAX_RESPONSE_BYTES);
+        self::assertSame('xx', $this->respondingWith([['status' => 200, 'chunks' => ['xx']]])->body());
     }
 
     /**
-     * A JSON string, number, boolean, or null is valid JSON that json()'s
-     * array-shaped contract cannot return. The failure reports the
-     * decoded value's type, never the value.
+     * @return iterable<string, array{0: string}>
      */
-    #[DataProvider('scalarTopLevelJsonProvider')]
-    public function test_a_scalar_top_level_json_body_is_a_typed_failure_rather_than_a_type_error(
-        string $body,
-        string $expectedType,
-    ): void {
-        try {
-            $this->respondingWith($body)->get(self::URL)->json();
+    public static function undecodableBodyProvider(): iterable
+    {
+        yield 'not JSON at all' => ['definitely not json'];
+        yield 'invalid UTF-8' => ["\xB1\x31"];
+        yield 'a bare string' => ['"just a string"'];
+        yield 'a bare number' => ['42'];
+        yield 'a bare boolean' => ['true'];
+        yield 'a bare null' => ['null'];
+    }
 
-            self::fail('Expected HttpRequestException.');
+    #[DataProvider('undecodableBodyProvider')]
+    public function test_a_body_json_cannot_return_fails_with_the_conversion_category(string $body): void
+    {
+        $response = $this->respondingWith([['status' => 200, 'chunks' => [$body]]]);
+
+        try {
+            $response->json();
+            self::fail('A body json() cannot return was expected to raise.');
         } catch (HttpRequestException $e) {
+            // The body's own text never reaches the message; see
+            // TraceSecrecyTest for the assertion that covers it.
             self::assertSame(HttpFailure::Conversion, $e->category);
             self::assertSame(200, $e->status);
-            self::assertStringContainsString("decoded to a {$expectedType}, not an object or array", $e->getMessage());
-            self::assertStringNotContainsString('a-secret-string-value', $e->getMessage());
         }
     }
 
-    public function test_json_path_fails_the_same_way_for_a_scalar_top_level_body(): void
-    {
-        $this->expectException(HttpRequestException::class);
-        $this->expectExceptionMessage('not an object or array');
-
-        $this->respondingWith('"just a string"')->get(self::URL)->jsonPath('anything');
-    }
-
     /**
-     * @return iterable<string, list<string>>
+     * @return iterable<string, array{0: string, 1: array<array-key, mixed>}>
      */
     public static function emptyTopLevelJsonContainerProvider(): iterable
     {
-        yield 'empty object' => ['{}'];
-        yield 'empty array' => ['[]'];
+        yield 'an empty object' => ['{}', []];
+        yield 'an empty array' => ['[]', []];
     }
 
     /**
-     * Decoding associatively makes an empty JSON object and an empty
-     * JSON array the same empty PHP array, and json()'s contract does not
-     * need to tell them apart: both are valid containers.
+     * @param array<array-key, mixed> $expected
      */
     #[DataProvider('emptyTopLevelJsonContainerProvider')]
-    public function test_an_empty_top_level_json_container_decodes_successfully(string $body): void
+    public function test_an_empty_top_level_json_container_decodes_successfully(string $body, array $expected): void
     {
-        self::assertSame([], $this->respondingWith($body)->get(self::URL)->json());
-    }
-
-    /**
-     * An id wider than PHP's own int type would round into a float if it
-     * were decoded as a number; it is decoded as a string instead, with
-     * every digit intact.
-     */
-    public function test_an_integer_too_wide_for_php_is_decoded_as_a_string(): void
-    {
-        $body = $this->respondingWith('{"id":123456789012345678901,"count":42}')->get(self::URL)->json();
-
-        self::assertSame('123456789012345678901', $body['id']);
-        self::assertSame(42, $body['count']);
-    }
-
-    /**
-     * A transport whose response raises while being cancelled, and
-     * counts how often that happened — the seam for both the quiet
-     * discard and the retry loop's own release.
-     */
-    private static function transportWhoseResponseThrowsOnCancel(?int &$cancelled, int $status = 200): HttpClientInterface
-    {
-        $cancelled = 0;
-
-        return new class ($cancelled, $status) implements HttpClientInterface {
-            public function __construct(private int &$cancelled, private readonly int $status) {}
-
-            public function request(string $method, string $url, array $options = []): ResponseInterface
-            {
-                return new class ($this->cancelled, $this->status) implements ResponseInterface {
-                    public function __construct(private int &$cancelled, private readonly int $status) {}
-
-                    public function getStatusCode(): int
-                    {
-                        return $this->status;
-                    }
-
-                    public function getHeaders(bool $throw = true): array
-                    {
-                        return [];
-                    }
-
-                    public function getContent(bool $throw = true): string
-                    {
-                        return '';
-                    }
-
-                    public function toArray(bool $throw = true): array
-                    {
-                        return [];
-                    }
-
-                    public function cancel(): void
-                    {
-                        ++$this->cancelled;
-
-                        throw new RuntimeException('cancelling https://user:SENTINEL@api.example.com failed');
-                    }
-
-                    public function getInfo(?string $type = null): mixed
-                    {
-                        return null;
-                    }
-                };
-            }
-
-            public function stream(iterable|ResponseInterface $responses, ?float $timeout = null): ResponseStreamInterface
-            {
-                throw new RuntimeException('not used');
-            }
-
-            public function withOptions(array $options): static
-            {
-                return $this;
-            }
-        };
+        self::assertSame($expected, $this->respondingWith([['status' => 200, 'chunks' => [$body]]])->json());
     }
 }

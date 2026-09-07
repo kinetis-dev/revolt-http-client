@@ -28,11 +28,9 @@ final class ScriptedResponse implements ResponseInterface
      * @param float $statusDelay seconds the status takes to arrive
      * @param string|null $readFailure a transport message raised instead of a body
      * @param string|null $statusFailure a transport message raised instead of a status
-     * @param float $readDelay seconds the body takes to arrive
-     * @param float $progressDelay seconds before the first progress report
-     * @param int $progressBeforeStatus bytes reported to the progress
-     *     hook while the status is being answered, the way a transport
-     *     that buffers a body reports them before anyone asked for one
+     * @param int $progressBeforeStatus bytes reported to the progress hook
+     *     while the status is being answered, the way a transport that
+     *     buffers a body reports them before anyone asked for one
      */
     public function __construct(
         private readonly int $status,
@@ -42,8 +40,6 @@ final class ScriptedResponse implements ResponseInterface
         private readonly float $statusDelay = 0.0,
         private readonly ?string $readFailure = null,
         private readonly ?string $statusFailure = null,
-        private readonly float $readDelay = 0.0,
-        private readonly float $progressDelay = 0.0,
         private readonly int $progressBeforeStatus = 0,
     ) {}
 
@@ -78,10 +74,6 @@ final class ScriptedResponse implements ResponseInterface
             throw new RuntimeException($this->readFailure);
         }
 
-        if ($this->readDelay > 0.0) {
-            usleep((int) ($this->readDelay * 1_000_000));
-        }
-
         $body = '';
 
         foreach ($this->chunks as $chunk) {
@@ -89,10 +81,6 @@ final class ScriptedResponse implements ResponseInterface
             ++$this->chunksDelivered;
 
             if ($this->onProgress !== null) {
-                if ($this->progressDelay > 0.0) {
-                    usleep((int) ($this->progressDelay * 1_000_000));
-                }
-
                 ($this->onProgress)(strlen($body));
             }
         }

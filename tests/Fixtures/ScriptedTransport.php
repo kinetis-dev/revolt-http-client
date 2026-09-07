@@ -16,14 +16,15 @@ use Symfony\Contracts\HttpClient\ResponseStreamInterface;
  * the sequence of answers it is about:
  *
  *     new ScriptedTransport([
- *         ['throw' => true],
+ *         ['status' => 503],
  *         ['status' => 200, 'chunks' => ['{"ok":true}']],
  *     ]);
  *
  * `throw` raises where a transport refuses to build a request, and its
  * message plants the secrets a real client's would; `chunks` is the body
  * as it arrives, `headers` what precedes it, `statusDelay` how long the
- * status takes, and `readFailure` a body that never comes.
+ * status takes, and `statusFailure`/`readFailure` an answer that never
+ * comes.
  */
 final class ScriptedTransport implements HttpClientInterface
 {
@@ -51,13 +52,9 @@ final class ScriptedTransport implements HttpClientInterface
         $this->options[] = $options;
         $this->urls[] = $url;
 
-        if (($step['requestDelay'] ?? 0.0) > 0.0) {
-            usleep((int) ($step['requestDelay'] * 1_000_000));
-        }
-
         if (($step['throw'] ?? false) === true) {
             throw new RuntimeException(
-                'cannot connect to https://SENTINELUSER:SENTINELPASS@api.example.com/SENTINELPATH?key=SENTINELQUERY',
+                'cannot connect to https://SENTINELTOKEN@api.example.com/SENTINELPATH?key=SENTINELQUERY',
             );
         }
 
@@ -71,8 +68,6 @@ final class ScriptedTransport implements HttpClientInterface
             $step['statusDelay'] ?? 0.0,
             $step['readFailure'] ?? null,
             $step['statusFailure'] ?? null,
-            $step['readDelay'] ?? 0.0,
-            $step['progressDelay'] ?? 0.0,
             $step['progressBeforeStatus'] ?? 0,
         );
     }
