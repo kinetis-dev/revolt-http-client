@@ -33,6 +33,11 @@ final class Preflight
     /** A URL is sent as bytes: no spaces, no controls, no unescaped non-ASCII. */
     private const string NON_URL_BYTE = '/[^\x21-\x7E]/';
 
+    /** The subject a URL rejection names, so every message about one URL reads alike. */
+    private const string BASE_URL_LABEL = 'A base URL';
+
+    private const string REQUEST_URL_LABEL = 'A request URL';
+
     /** Retries are bounded by construction, not only by what a caller asks for. */
     private const int MAX_RETRIES = 10;
 
@@ -59,7 +64,7 @@ final class Preflight
      */
     public static function baseUri(#[SensitiveParameter] string $baseUrl): array
     {
-        self::assertUrlBytes($baseUrl, 'A base URL');
+        self::assertUrlBytes($baseUrl, self::BASE_URL_LABEL);
 
         $parts = parse_url($baseUrl);
 
@@ -71,9 +76,9 @@ final class Preflight
             throw HttpRequestException::invalidRequest('A base URL must carry no query string and no fragment.');
         }
 
-        $origin = self::origin($parts, 'A base URL');
+        $origin = self::origin($parts, self::BASE_URL_LABEL);
         $path = $parts['path'] ?? '';
-        $prefix = $path === '' ? '/' : '/' . trim(self::assertNoDotSegments($path, 'A base URL'), '/') . '/';
+        $prefix = $path === '' ? '/' : '/' . trim(self::assertNoDotSegments($path, self::BASE_URL_LABEL), '/') . '/';
 
         return [$origin, $origin . $prefix];
     }
@@ -90,7 +95,7 @@ final class Preflight
      */
     public static function target(#[SensitiveParameter] ?array $base, #[SensitiveParameter] string $url): array
     {
-        self::assertUrlBytes($url, 'A request URL');
+        self::assertUrlBytes($url, self::REQUEST_URL_LABEL);
 
         if (str_contains($url, '#')) {
             throw HttpRequestException::invalidRequest('A request URL must carry no fragment.');
@@ -103,9 +108,9 @@ final class Preflight
                 throw HttpRequestException::invalidRequest('With no base URL, a request URL must be absolute.');
             }
 
-            $origin = self::origin($parts, 'A request URL');
+            $origin = self::origin($parts, self::REQUEST_URL_LABEL);
             $path = $parts['path'] ?? '';
-            $path = $path === '' ? '/' : self::assertNoDotSegments($path, 'A request URL');
+            $path = $path === '' ? '/' : self::assertNoDotSegments($path, self::REQUEST_URL_LABEL);
 
             return [$origin . $path . (isset($parts['query']) ? '?' . $parts['query'] : ''), $origin];
         }
@@ -118,7 +123,7 @@ final class Preflight
         }
 
         $questionMark = strpos($url, '?');
-        $path = self::assertNoDotSegments($questionMark === false ? $url : substr($url, 0, $questionMark), 'A request URL');
+        $path = self::assertNoDotSegments($questionMark === false ? $url : substr($url, 0, $questionMark), self::REQUEST_URL_LABEL);
 
         return [
             $base[1] . ltrim($path, '/') . ($questionMark === false ? '' : substr($url, $questionMark)),
