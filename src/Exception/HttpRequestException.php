@@ -40,10 +40,18 @@ final class HttpRequestException extends RuntimeException
         return new self($problem, HttpFailure::InvalidRequest, 0);
     }
 
-    /** No response arrived, or the response stopped arriving. */
+    /**
+     * No complete response arrived: none at all, or one that stopped
+     * arriving. The request may already have reached the server and been
+     * applied, so the outcome is unknown rather than refused.
+     */
     public static function transportFailure(string $method, string $origin): self
     {
-        return new self("{$method} {$origin} failed before any response arrived.", HttpFailure::Transport, 0);
+        return new self(
+            "{$method} {$origin} failed before a complete response arrived; the server may have received the request.",
+            HttpFailure::Transport,
+            0,
+        );
     }
 
     /** The whole operation — every attempt and every backoff — ran past its budget. */

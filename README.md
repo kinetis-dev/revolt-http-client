@@ -54,11 +54,16 @@ blocking the whole process — so several run at once through
   whether a new origin may see this client's `Authorization` header,
   cookies, and body — a decision belonging to the caller who knows what
   the credential is for.
-- **One retry layer, and one total deadline.** `withRetries()` is the
-  only way to configure retries, the transport underneath makes one wire
-  attempt per request, a per-call retry option is refused rather than
-  merged, and a body that cannot be replayed is refused rather than
-  resent. `withTimeout()` bounds the whole operation on a monotonic
+- **One retry layer, for idempotent methods only, and one total
+  deadline.** `withRetries()` is the only way to configure retries, the
+  transport underneath makes one wire attempt per request, and a
+  per-call retry option is refused rather than merged. Retries apply
+  only to exactly `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and
+  `DELETE`; every other method, `POST` and `PATCH` included, is sent
+  once, because neither a dropped connection nor a retryable status
+  proves the server did not apply it. A stream or `Closure` body is
+  refused on a request that could be retried, rather than resent.
+  `withTimeout()` bounds the whole operation on a monotonic
   clock — every attempt, every backoff, and every read of the
   response — and is enforced here rather than trusted to the transport.
 - **A bounded response.** `withMaxResponseBytes()` is the ceiling a body

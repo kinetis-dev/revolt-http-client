@@ -43,6 +43,13 @@ final class Http
      */
     private const array RETRYABLE_STATUSES = [429, 500, 502, 503, 504];
 
+    /**
+     * RFC 9110's idempotent methods, matched exactly. A repeat of any
+     * other request can apply it twice, and neither a dropped connection
+     * nor a retryable status proves the first one was not applied.
+     */
+    private const array IDEMPOTENT_METHODS = ['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE'];
+
     /** Doubling from here, and always inside the total timeout. */
     private const float FIRST_BACKOFF_SECONDS = 0.1;
 
@@ -172,11 +179,13 @@ final class Http
     }
 
     /**
-     * Sends a failed request again, up to $times more times (at most
-     * 10), with backoff doubling from 100 ms inside the one operation
-     * deadline. Out of retries, or of budget for the next backoff, the
-     * last response received is returned; a transport failure with no
-     * response behind it throws instead.
+     * Sends a failed GET, HEAD, OPTIONS, TRACE, PUT or DELETE request
+     * again, up to $times more times (at most 10), with backoff doubling
+     * from 100 ms inside the one operation deadline. Out of retries, or of
+     * budget for the next backoff, the last response received is
+     * returned; a transport failure with no response behind it throws
+     * instead. Every other method is sent once, as a client without
+     * retries sends it.
      */
     public function withRetries(int $times = 3): self
     {
@@ -264,13 +273,22 @@ final class Http
             $transportOptions['query'] = $query;
         }
 
+        $retries = in_array($method, self::IDEMPOTENT_METHODS, true) ? $this->retries : 0;
+
         if (array_key_exists('json', $options)) {
             $transportOptions['json'] = $options['json'];
         } elseif (array_key_exists('body', $options)) {
-            $transportOptions['body'] = $this->replayableBody($options['body']);
+            $transportOptions['body'] = self::replayableBody($options['body'], $retries);
         }
 
-        return $this->dispatch($method, $target, $origin, $transportOptions, $options['timeout'] ?? $this->timeout);
+        return $this->dispatch(
+            $method,
+            $target,
+            $origin,
+            $transportOptions,
+            $options['timeout'] ?? $this->timeout,
+            $retries,
+        );
     }
 
     /**
@@ -292,10 +310,11 @@ final class Http
     }
 
     /**
-     * One attempt, then as many more as `withRetries()` allows, all
-     * inside a single deadline: each attempt gets only what is left of
-     * it, and the {@see ResponseBudget} handed to the surviving response
-     * carries the same deadline into every read of it.
+     * One attempt, then as many more as $retries allows — `withRetries()`
+     * for an idempotent method, none for any other — all inside a single
+     * deadline: each attempt gets only what is left of it, and the
+     * {@see ResponseBudget} handed to the surviving response carries the
+     * same deadline into every read of it.
      *
      * @param array<string, mixed> $options
      */
@@ -305,6 +324,7 @@ final class Http
         string $origin,
         #[SensitiveParameter] array $options,
         float $timeout,
+        int $retries,
     ): HttpResponse {
         $budget = new ResponseBudget($method, $origin, $timeout, $this->maxResponseBytes);
 
@@ -316,7 +336,7 @@ final class Http
             ++$budget->attempts;
             $response = new HttpResponse($this->issue($method, $target, $budget->applyTo($options)), $budget);
 
-            if ($this->retries === 0) {
+            if ($retries === 0) {
                 // Nothing left to decide, so the response stays deferred
                 // and every read of it happens where the caller asked.
                 return $response;
@@ -342,7 +362,7 @@ final class Http
 
             $backoff = self::FIRST_BACKOFF_SECONDS * 2 ** ($budget->attempts - 1);
 
-            if ($budget->attempts > $this->retries || $backoff >= $budget->remaining()) {
+            if ($budget->attempts > $retries || $backoff >= $budget->remaining()) {
                 return $status === null ? throw $budget->transportFailure() : $response;
             }
 
@@ -374,14 +394,14 @@ final class Http
 
     /**
      * A stream resource or a Closure is consumed as it is read, so a
-     * retrying client refuses one rather than resending a body that is
-     * already gone.
+     * request that may be retried refuses one rather than resending a
+     * body that is already gone. A request sent once takes it as it is.
      */
-    private function replayableBody(#[SensitiveParameter] mixed $body): mixed
+    private static function replayableBody(#[SensitiveParameter] mixed $body, int $retries): mixed
     {
-        if ($this->retries > 0 && (is_resource($body) || $body instanceof Closure)) {
+        if ($retries > 0 && (is_resource($body) || $body instanceof Closure)) {
             throw HttpRequestException::invalidRequest(
-                'A stream or Closure body cannot be replayed, so it cannot be sent by a client with retries.',
+                'A stream or Closure body cannot be replayed, so it cannot be sent with a method this client retries.',
             );
         }
 

@@ -48,7 +48,10 @@ final class HttpResponse
         $this->releaseOnce();
     }
 
-    /** @throws HttpRequestException when no response arrived at all. */
+    /**
+     * @throws HttpRequestException when no complete response arrived; the
+     *     server may still have received the request.
+     */
     public function status(): int
     {
         return $this->read($this->response->getStatusCode(...));

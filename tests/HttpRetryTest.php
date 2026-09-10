@@ -19,6 +19,8 @@ final class HttpRetryTest extends TestCase
 {
     private const string URL = 'https://api.example.com/orders';
 
+    private const string TRANSPORT_FAILURE = 'failed before a complete response arrived; the server may have received the request.';
+
     /** @param list<array<string, mixed>> $script */
     private function client(array $script, int $retries = 2, float $timeout = 5.0): Http
     {
@@ -44,6 +46,84 @@ final class HttpRetryTest extends TestCase
 
         self::assertSame(200, $response->status());
         self::assertSame(3, $transport->requests);
+    }
+
+    /**
+     * @return iterable<string, array{0: string}>
+     */
+    public static function idempotentMethodProvider(): iterable
+    {
+        foreach (['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE'] as $method) {
+            yield $method => [$method];
+        }
+    }
+
+    /**
+     * The backoffs before the third attempt, 100 ms and 200 ms, come out
+     * of the same budget the first attempt was handed.
+     */
+    #[DataProvider('idempotentMethodProvider')]
+    public function test_an_idempotent_method_retries_a_transport_failure_and_a_status_inside_one_deadline(
+        string $method,
+    ): void {
+        $transport = new ScriptedTransport([
+            ['statusFailure' => 'connection reset'],
+            ['status' => 503],
+            ['status' => 200],
+        ]);
+
+        $response = new Http($transport)->withRetries(2)->withTimeout(5.0)->send($method, self::URL);
+
+        self::assertSame(200, $response->status());
+        self::assertSame(3, $transport->requests);
+        self::assertLessThanOrEqual(5.0 - 0.1 - 0.2, $transport->options[2]['timeout']);
+    }
+
+    /**
+     * @return iterable<string, array{0: string}>
+     */
+    public static function nonIdempotentMethodProvider(): iterable
+    {
+        yield 'POST' => ['POST'];
+        yield 'PATCH' => ['PATCH'];
+    }
+
+    /** A retryable status can follow work the server already did. */
+    #[DataProvider('nonIdempotentMethodProvider')]
+    public function test_a_non_idempotent_method_returns_a_retryable_status_after_one_attempt(string $method): void
+    {
+        $transport = new ScriptedTransport([['status' => 503], ['status' => 200]]);
+
+        self::assertSame(503, new Http($transport)->withRetries(3)->send($method, self::URL)->status());
+        self::assertSame(1, $transport->requests);
+    }
+
+    /**
+     * A connection can close after the server applied the request and
+     * before its status line arrives. The one attempt stays deferred, as
+     * on a client without retries: send() reads nothing, and the failure
+     * raises from the read that meets it.
+     */
+    #[DataProvider('nonIdempotentMethodProvider')]
+    public function test_a_non_idempotent_transport_failure_raises_from_the_read_after_one_attempt(string $method): void
+    {
+        $transport = new ScriptedTransport([['statusFailure' => 'connection reset'], ['status' => 200]]);
+
+        $response = new Http($transport)->withRetries(3)->send($method, self::URL);
+
+        // A status read that failed would already have released the response.
+        self::assertSame(1, $transport->requests);
+        self::assertSame(0, $transport->cancellations());
+
+        try {
+            $response->status();
+            self::fail('A transport failure was expected to raise from the read.');
+        } catch (HttpRequestException $e) {
+            self::assertSame(HttpFailure::Transport, $e->category);
+            self::assertSame("{$method} https://api.example.com " . self::TRANSPORT_FAILURE, $e->getMessage());
+        }
+
+        self::assertSame(1, $transport->requests);
     }
 
     /**
@@ -90,7 +170,7 @@ final class HttpRetryTest extends TestCase
             self::fail('A transport failure was expected to raise.');
         } catch (HttpRequestException $e) {
             self::assertSame(HttpFailure::Transport, $e->category);
-            self::assertSame('GET https://api.example.com failed before any response arrived.', $e->getMessage());
+            self::assertSame('GET https://api.example.com ' . self::TRANSPORT_FAILURE, $e->getMessage());
         }
 
         self::assertSame(3, $transport->requests);
@@ -221,7 +301,7 @@ final class HttpRetryTest extends TestCase
     {
         $transport = new ScriptedTransport([['status' => 503], ['status' => 200]]);
 
-        new Http($transport)->withRetries(1)->send('POST', self::URL, ['body' => 'a=1'])->status();
+        new Http($transport)->withRetries(1)->send('PUT', self::URL, ['body' => 'a=1'])->status();
 
         self::assertSame('a=1', $transport->options[0]['body']);
         self::assertSame('a=1', $transport->options[1]['body']);
@@ -237,12 +317,12 @@ final class HttpRetryTest extends TestCase
     }
 
     #[DataProvider('nonReplayableBodyProvider')]
-    public function test_a_body_that_cannot_be_replayed_is_refused_by_a_retrying_client(mixed $body): void
+    public function test_a_body_that_cannot_be_replayed_is_refused_for_a_method_the_client_retries(mixed $body): void
     {
         $transport = new ScriptedTransport([['status' => 200]]);
 
         try {
-            new Http($transport)->withRetries(1)->send('POST', self::URL, ['body' => $body]);
+            new Http($transport)->withRetries(1)->send('PUT', self::URL, ['body' => $body]);
             self::fail('A body that cannot be replayed was expected to be refused.');
         } catch (HttpRequestException $e) {
             self::assertSame(HttpFailure::InvalidRequest, $e->category);
@@ -252,11 +332,22 @@ final class HttpRetryTest extends TestCase
     }
 
     #[DataProvider('nonReplayableBodyProvider')]
+    public function test_a_body_that_cannot_be_replayed_is_sent_once_for_a_method_the_client_never_retries(
+        mixed $body,
+    ): void {
+        $transport = new ScriptedTransport([['status' => 503], ['status' => 200]]);
+
+        self::assertSame(503, new Http($transport)->withRetries(1)->send('POST', self::URL, ['body' => $body])->status());
+        self::assertSame(1, $transport->requests);
+        self::assertSame($body, $transport->options[0]['body']);
+    }
+
+    #[DataProvider('nonReplayableBodyProvider')]
     public function test_a_body_that_cannot_be_replayed_is_accepted_without_retries(mixed $body): void
     {
         $transport = new ScriptedTransport([['status' => 200]]);
 
-        self::assertSame(200, new Http($transport)->send('POST', self::URL, ['body' => $body])->status());
+        self::assertSame(200, new Http($transport)->send('PUT', self::URL, ['body' => $body])->status());
         self::assertSame(1, $transport->requests);
     }
 }

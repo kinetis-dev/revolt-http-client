@@ -22,7 +22,10 @@ enum HttpFailure: string
     /** Reading a response as JSON failed. */
     case Conversion = 'conversion';
 
-    /** No response arrived: DNS, a refused connection, a dropped socket. */
+    /**
+     * No complete response arrived: DNS, a refused connection, a dropped
+     * socket. The server may still have received and applied the request.
+     */
     case Transport = 'transport';
 
     /** The total timeout for the operation ran out. */
