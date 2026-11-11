@@ -10,8 +10,10 @@ namespace Kinetis\RevoltHttpClient;
  * asks before every wire attempt, retries included, and waits out the
  * answer inside the operation's deadline.
  *
- * `docs/revolt-http-client.md` states how the answer is applied, and
- * `docs/application-recipes.md` gives implementations.
+ * {@link https://kinetis.dev/docs/revolt-http-client.html} states how the
+ * answer is applied, and
+ * {@link https://kinetis.dev/docs/application-recipes.html} gives
+ * implementations.
  */
 interface RequestPacer
 {

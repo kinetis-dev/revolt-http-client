@@ -32,10 +32,14 @@ final class HttpResponse
 
     private bool $released = false;
 
+    private readonly int $attempts;
+
     public function __construct(
         #[SensitiveParameter] private readonly ResponseInterface $response,
         #[SensitiveParameter] private readonly ResponseBudget $budget,
-    ) {}
+    ) {
+        $this->attempts = $budget->attempts;
+    }
 
     /**
      * The fallback for a response nobody read and nobody discarded.
@@ -46,6 +50,18 @@ final class HttpResponse
     public function __destruct()
     {
         $this->releaseOnce();
+    }
+
+    /**
+     * The wire attempts the operation sent, this response's included: 1
+     * without retries, and a retry the budget or the pacer left no room
+     * for is not counted. Known when the response is created, so it
+     * reads nothing from the transport, never throws, and still answers
+     * after {@see discard()}.
+     */
+    public function attempts(): int
+    {
+        return $this->attempts;
     }
 
     /**

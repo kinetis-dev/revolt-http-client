@@ -84,7 +84,8 @@ blocking the whole process — so several run at once through
 An error status is not one of those failures: `successful()`, `failed()`,
 `clientError()`, `serverError()`, and `redirect()` are answers to branch
 on, and `throw()` opts into raising instead. Read the body with `json()`,
-`jsonPath('customer.email')`, or `body()`.
+`jsonPath('customer.email')`, or `body()`. `attempts()` reports how
+many wire attempts the call sent, retries included.
 
 `AmpHttpClientFactory::create()` returns the underlying Symfony
 `HttpClientInterface` on its own, for libraries that want to be handed a

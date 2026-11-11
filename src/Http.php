@@ -31,10 +31,11 @@ use Throwable;
  * a configured instance instead, so one connection pool outlives the
  * request. Every `with*` method returns a new instance.
  *
- * `docs/revolt-http-client.md` states what this client guarantees. An
- * injected transport is the caller's to hold to the same contract: one
- * wire attempt per request, and no credentials or base URI of its own,
- * which the origin pinning here cannot see and so cannot pin.
+ * {@link https://kinetis.dev/docs/revolt-http-client.html} states what
+ * this client guarantees. An injected transport is the caller's to hold
+ * to the same contract: one wire attempt per request, and no credentials
+ * or base URI of its own, which the origin pinning here cannot see and
+ * so cannot pin.
  */
 final class Http
 {
@@ -64,8 +65,9 @@ final class Http
     /**
      * Asked for on every request and not a caller's to change: the byte
      * ceiling counts what arrives, which bounds memory only while
-     * nothing inflates the body in between. `docs/revolt-http-client.md`
-     * states what that trades away.
+     * nothing inflates the body in between.
+     * {@link https://kinetis.dev/docs/revolt-http-client.html} states what
+     * that trades away.
      */
     private const array IDENTITY_ENCODING = ['name' => 'Accept-Encoding', 'values' => ['identity']];
 

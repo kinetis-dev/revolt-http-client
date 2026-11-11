@@ -31,7 +31,7 @@ final class ResponseBudget
      */
     public bool $exceeded = false;
 
-    /** Wire attempts made so far, for the timeout message. */
+    /** Wire attempts made so far, for the timeout message and {@see HttpResponse::attempts()}. */
     public int $attempts = 0;
 
     private readonly float $expiresAt;
