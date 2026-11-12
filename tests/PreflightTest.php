@@ -75,6 +75,8 @@ final class PreflightTest extends TestCase
         yield 'response ceiling of zero' => [fn (Http $h) => $h->withMaxResponseBytes(0)];
         yield 'negative retry count' => [fn (Http $h) => $h->withRetries(-1)];
         yield 'retry count above the bound' => [fn (Http $h) => $h->withRetries(11)];
+        yield 'retried status outside the retryable set' => [fn (Http $h) => $h->withRetries(3, [503, 404])];
+        yield 'retried status that is not an integer' => [fn (Http $h) => $h->withRetries(3, ['429'])];
 
         yield 'unsupported per-call option' => [
             fn (Http $h) => $h->send('GET', 'https://api.example.com/orders', ['verify_peer' => false]),

@@ -145,6 +145,38 @@ final class HttpRetryTest extends TestCase
         self::assertSame(1, $transport->requests);
     }
 
+    public function test_a_status_left_out_of_the_retried_statuses_is_returned_after_one_attempt(): void
+    {
+        $transport = new ScriptedTransport([['status' => 429], ['status' => 200]]);
+
+        $response = new Http($transport)->withRetries(3, [500, 502, 503, 504])->get(self::URL);
+
+        self::assertSame(429, $response->status());
+        self::assertSame(1, $response->attempts());
+        self::assertSame(1, $transport->requests);
+    }
+
+    public function test_no_retried_statuses_still_retries_a_transport_failure(): void
+    {
+        $transport = new ScriptedTransport([['statusFailure' => 'connection reset'], ['status' => 503], ['status' => 200]]);
+
+        $response = new Http($transport)->withRetries(3, [])->get(self::URL);
+
+        self::assertSame(503, $response->status());
+        self::assertSame(2, $response->attempts());
+        self::assertSame(2, $transport->requests);
+    }
+
+    public function test_narrowing_the_retried_statuses_leaves_the_original_client_unchanged(): void
+    {
+        $transport = new ScriptedTransport([['status' => 429], ['status' => 200]]);
+        $http = new Http($transport)->withRetries(3);
+        $http->withRetries(3, [503]);
+
+        self::assertSame(200, $http->get(self::URL)->status());
+        self::assertSame(2, $transport->requests);
+    }
+
     public function test_retries_are_bounded_and_the_last_answer_is_returned(): void
     {
         $transport = new ScriptedTransport([['status' => 503]]);

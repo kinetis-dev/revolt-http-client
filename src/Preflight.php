@@ -162,6 +162,31 @@ final class Preflight
     }
 
     /**
+     * The statuses a retry follows: integers drawn from $allowed, none
+     * of them required.
+     *
+     * @param array<mixed> $statuses
+     * @param list<int> $allowed
+     * @return list<int>
+     */
+    public static function retryStatuses(array $statuses, array $allowed): array
+    {
+        $resolved = [];
+
+        foreach ($statuses as $status) {
+            if (!is_int($status) || !in_array($status, $allowed, true)) {
+                throw HttpRequestException::invalidRequest(
+                    'A retried status must be one of ' . implode(', ', $allowed) . '.',
+                );
+            }
+
+            $resolved[] = $status;
+        }
+
+        return $resolved;
+    }
+
+    /**
      * Headers as `'Name' => 'value'` or `'Name' => ['v1', 'v2']`. A name
      * is an RFC 9110 token appearing once per array, case-insensitively;
      * a value is a string or a non-empty list of strings, rejected rather

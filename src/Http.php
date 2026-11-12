@@ -42,7 +42,8 @@ final class Http
     /**
      * Statuses worth sending the same request for again: the server
      * either said so or failed in a commonly transient way. Every other
-     * status, 4xx included, is an answer a repeat cannot change.
+     * status, 4xx included, is an answer a repeat cannot change. The
+     * default `withRetries()` retries, and the set it may narrow.
      */
     private const array RETRYABLE_STATUSES = [429, 500, 502, 503, 504];
 
@@ -91,6 +92,9 @@ final class Http
     private int $maxResponseBytes = self::DEFAULT_MAX_RESPONSE_BYTES;
 
     private int $retries = 0;
+
+    /** @var list<int> */
+    private array $retryStatuses = self::RETRYABLE_STATUSES;
 
     private bool $sendAsForm = false;
 
@@ -196,11 +200,19 @@ final class Http
      * received is returned; a transport failure with no response behind
      * it throws instead. Every other method is sent once, as a client
      * without retries sends it.
+     *
+     * $statuses narrows which responses are retried to a subset of 429,
+     * 500, 502, 503 and 504; any other status is refused. A status left
+     * out is returned as the final response at once, `Retry-After`
+     * unread. An empty list retries transport failures only.
+     *
+     * @param list<int> $statuses
      */
-    public function withRetries(int $times = 3): self
+    public function withRetries(int $times = 3, array $statuses = self::RETRYABLE_STATUSES): self
     {
         $clone = clone $this;
         $clone->retries = Preflight::retries($times);
+        $clone->retryStatuses = Preflight::retryStatuses($statuses, self::RETRYABLE_STATUSES);
 
         return $clone;
     }
@@ -392,7 +404,7 @@ final class Http
                 $status = null;
             }
 
-            if ($status !== null && !in_array($status, self::RETRYABLE_STATUSES, true)) {
+            if ($status !== null && !in_array($status, $this->retryStatuses, true)) {
                 return $response;
             }
 
