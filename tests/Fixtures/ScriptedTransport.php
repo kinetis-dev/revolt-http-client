@@ -24,7 +24,7 @@ use Symfony\Contracts\HttpClient\ResponseStreamInterface;
  * message plants the secrets a real client's would; `chunks` is the body
  * as it arrives, `headers` what precedes it, `statusDelay` how long the
  * status takes, and `statusFailure`/`readFailure` an answer that never
- * comes.
+ * comes. A stream read always fails, as a dropped one would.
  */
 final class ScriptedTransport implements HttpClientInterface
 {
@@ -74,7 +74,9 @@ final class ScriptedTransport implements HttpClientInterface
 
     public function stream(iterable|ResponseInterface $responses, ?float $timeout = null): ResponseStreamInterface
     {
-        throw new RuntimeException('this transport hands out complete scripted answers, never a stream');
+        // Scripted answers are complete, never streamed, so a stream
+        // read fails the way a dropped one does, secrets in its message.
+        throw new RuntimeException('stream of https://SENTINELTOKEN@api.example.com/SENTINELPATH?key=SENTINELQUERY failed');
     }
 
     /**

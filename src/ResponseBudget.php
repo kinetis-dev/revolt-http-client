@@ -68,7 +68,7 @@ final class ResponseBudget
      * response declaring no length or understating it cannot materialize
      * and be measured afterwards; the deadline aborts a transfer still
      * arriving after the budget is spent. Only bytes that arrived are
-     * counted — a declared size belongs to {@see HttpResponse::body()}.
+     * counted — a declared size belongs to {@see HttpResponse}'s reads.
      *
      * @return Closure(int): void
      */

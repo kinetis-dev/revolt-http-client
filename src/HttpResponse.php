@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace Kinetis\RevoltHttpClient;
 
 use Closure;
+use Generator;
 use JsonException;
 use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
 use Revolt\EventLoop;
+use RuntimeException;
 use SensitiveParameter;
+use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
 use Throwable;
 
@@ -20,9 +23,10 @@ use Throwable;
  * `Kinetis\Async\concurrently()` overlap.
  *
  * This object owns the underlying transport response for as long as it
- * lives, and releases it on {@see discard()}, on a full read, and on
- * collection. The operation's deadline reaches every read: one refused
- * before it and one that answers after it both report the timeout.
+ * lives, and releases it on {@see discard()}, on a full read, on a
+ * stream left before its end, and on collection. The operation's
+ * deadline reaches every read: one refused before it and one that
+ * answers after it both report the timeout.
  */
 final class HttpResponse
 {
@@ -32,11 +36,20 @@ final class HttpResponse
 
     private bool $released = false;
 
+    /** Set once {@see chunks()} hands out the body, which can then be read no other way. */
+    private bool $streamed = false;
+
     private readonly int $attempts;
 
+    /**
+     * @internal {@see Http} builds every instance; $transport is the
+     *     client that issued $response, and what {@see chunks()} reads it
+     *     through.
+     */
     public function __construct(
         #[SensitiveParameter] private readonly ResponseInterface $response,
         #[SensitiveParameter] private readonly ResponseBudget $budget,
+        #[SensitiveParameter] private readonly HttpClientInterface $transport,
     ) {
         $this->attempts = $budget->attempts;
     }
@@ -113,7 +126,8 @@ final class HttpResponse
      * {@see Http::withMaxResponseBytes()} sets at all three points a body
      * can pass it — a `Content-Length` past it, the transfer itself, and
      * the bytes that arrived — so no path ends with the whole of an
-     * untrusted reply in memory.
+     * untrusted reply in memory. A body {@see chunks()} handed out is not
+     * buffered, so reading it here fails with the `Consumed` category.
      */
     public function body(): string
     {
@@ -123,11 +137,11 @@ final class HttpResponse
             return $this->body;
         }
 
-        $declared = $this->header('Content-Length');
-
-        if ($declared !== null && ctype_digit($declared) && (int) $declared > $this->budget->maxBytes) {
-            throw $this->tooLarge();
+        if ($this->streamed) {
+            throw HttpRequestException::consumed($this->budget->method, $this->budget->origin);
         }
+
+        $this->guardDeclaredLength();
 
         // getContent(false) suppresses the transport's own
         // throw-on-error-status, leaving that decision here.
@@ -143,6 +157,40 @@ final class HttpResponse
         $this->released = true;
 
         return $this->body = $body;
+    }
+
+    /**
+     * The body as it arrives, one non-empty piece per read of the
+     * transport, for a reply too long or too incremental to buffer. The
+     * calling Fiber suspends between pieces, so the loop keeps running.
+     *
+     * The operation's budget covers the whole stream: the deadline is
+     * the one every other read shares, and the byte ceiling counts every
+     * piece, so a piece that would carry the total past it is never
+     * handed over. A `Content-Length` past the ceiling is refused here,
+     * before anything is read. Leaving the loop early — `break`, an
+     * exception, or dropping the generator — releases the transport
+     * response. The body is read once: after this, {@see body()},
+     * {@see json()} and another call here fail with the `Consumed`
+     * category, as a call here does after {@see body()}.
+     *
+     * @return Generator<int, string>
+     */
+    public function chunks(): Generator
+    {
+        $this->guardNotDiscarded();
+
+        if ($this->streamed || $this->body !== null) {
+            throw HttpRequestException::consumed($this->budget->method, $this->budget->origin);
+        }
+
+        // Reading the headers settles the response before the transport
+        // streams it, which would otherwise raise on an error status.
+        $this->guardDeclaredLength();
+
+        $this->streamed = true;
+
+        return $this->stream();
     }
 
     /**
@@ -231,6 +279,66 @@ final class HttpResponse
         $this->discarded = true;
 
         $this->releaseOnce();
+    }
+
+    /** @return Generator<int, string> */
+    private function stream(): Generator
+    {
+        $received = 0;
+        $ended = false;
+
+        try {
+            while (($piece = $this->read($this->nextPiece(...))) !== null) {
+                $received += strlen($piece);
+
+                // The Amp transport runs the progress guard only when it is
+                // read, after bytes it had already queued, so the count
+                // that keeps them from the caller is this one.
+                if ($received > $this->budget->maxBytes) {
+                    throw $this->tooLarge();
+                }
+
+                yield $piece;
+            }
+
+            $ended = true;
+        } finally {
+            // A body read to its end leaves nothing to cancel; anything
+            // else ends ownership here, whoever stopped the loop.
+            if ($ended) {
+                $this->released = true;
+            } else {
+                $this->releaseOnce();
+            }
+        }
+    }
+
+    /**
+     * The next non-empty piece of the body, or null at its end. Each
+     * step opens a fresh transport stream bounded by what is left of the
+     * budget, so an upstream that stalls is cut off at the deadline;
+     * {@see read()} reports that as the timeout it is.
+     */
+    private function nextPiece(): ?string
+    {
+        foreach ($this->transport->stream($this->response, max(0.0, $this->budget->remaining())) as $chunk) {
+            // isTimeout() is also what raises a chunk carrying a transport error.
+            if ($chunk->isTimeout()) {
+                throw new RuntimeException('The stream went idle until the deadline.');
+            }
+
+            if ($chunk->isLast()) {
+                return null;
+            }
+
+            $piece = $chunk->getContent();
+
+            if ($piece !== '') {
+                return $piece;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -329,6 +437,16 @@ final class HttpResponse
             $this->status(),
             $problem,
         );
+    }
+
+    /** A declared length past the ceiling is refused before any body is read. */
+    private function guardDeclaredLength(): void
+    {
+        $declared = $this->header('Content-Length');
+
+        if ($declared !== null && ctype_digit($declared) && (int) $declared > $this->budget->maxBytes) {
+            throw $this->tooLarge();
+        }
     }
 
     /** A fresh failure for the ceiling, and no more reads of a body that passed it. */

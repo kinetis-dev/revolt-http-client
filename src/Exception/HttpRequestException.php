@@ -99,4 +99,14 @@ final class HttpRequestException extends RuntimeException
             0,
         );
     }
+
+    /** The body was already taken by an earlier read: buffered by `body()`, or streamed by `chunks()`. */
+    public static function consumed(string $method, string $origin): self
+    {
+        return new self(
+            "{$method} {$origin} has a body an earlier read already took; read it once, with body() or with chunks().",
+            HttpFailure::Consumed,
+            0,
+        );
+    }
 }

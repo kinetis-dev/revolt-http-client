@@ -39,4 +39,11 @@ enum HttpFailure: string
 
     /** A read was attempted on a response whose body had already been released. */
     case Discarded = 'discarded';
+
+    /**
+     * The body was asked for a second way: `HttpResponse::body()` or
+     * `json()` after `chunks()`, or `chunks()` after either or after
+     * itself. A body is read once, buffered or streamed.
+     */
+    case Consumed = 'consumed';
 }

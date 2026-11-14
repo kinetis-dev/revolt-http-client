@@ -382,7 +382,11 @@ final class Http
             }
 
             ++$budget->attempts;
-            $response = new HttpResponse($this->issue($method, $target, $budget->applyTo($options)), $budget);
+            $response = new HttpResponse(
+                $this->issue($method, $target, $budget->applyTo($options)),
+                $budget,
+                $this->transport,
+            );
 
             if ($retries === 0) {
                 // Nothing left to decide, so the response stays deferred

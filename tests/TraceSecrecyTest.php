@@ -61,6 +61,19 @@ final class TraceSecrecyTest extends TestCase
                 ->body();
         }];
 
+        yield 'a streamed read that fails on the wire' => [static function () {
+            $response = new Http(new ScriptedTransport([['status' => 200]]))
+                ->withBaseUrl('https://api.example.com')
+                ->withToken(self::TOKEN)
+                ->get('/' . self::PATH . '?q=' . self::QUERY);
+
+            foreach ($response->chunks() as $piece) {
+                return $piece;
+            }
+
+            return null;
+        }];
+
         yield 'an error status raised on' => [static fn () => new Http(new ScriptedTransport([['status' => 500]]))
             ->withBaseUrl('https://api.example.com')
             ->withToken(self::TOKEN)

@@ -12,6 +12,8 @@ use Kinetis\RevoltHttpClient\HttpResponse;
 use Kinetis\RevoltHttpClient\Tests\Fixtures\ScriptedTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\HttpClient\MockHttpClient;
+use Symfony\Component\HttpClient\Response\MockResponse;
 
 /**
  * What the response owns: the transport response it releases, the byte
@@ -243,5 +245,19 @@ final class HttpResponseTest extends TestCase
     public function test_an_empty_top_level_json_container_decodes_successfully(string $body, array $expected): void
     {
         self::assertSame($expected, $this->respondingWith([['status' => 200, 'chunks' => [$body]]])->json());
+    }
+
+    /**
+     * The test double the guide recommends streams through the same
+     * transport `stream()` the real client does, an error status
+     * included.
+     */
+    public function test_a_mock_transport_streams_its_body_in_pieces(): void
+    {
+        $response = new Http(new MockHttpClient([new MockResponse(['data: 1', 'data: 2'], ['http_code' => 404])]))
+            ->get(self::URL);
+
+        self::assertSame(['data: 1', 'data: 2'], iterator_to_array($response->chunks(), false));
+        self::assertSame(404, $response->status());
     }
 }
