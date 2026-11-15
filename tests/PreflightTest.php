@@ -136,11 +136,11 @@ final class PreflightTest extends TestCase
         $this->http()->withHeaders([$name => 'evil.test']);
     }
 
-    public function test_the_client_sends_identity_encoding_and_forbids_redirects(): void
+    public function test_the_client_asks_for_gzip_and_deflate_and_forbids_transport_redirects(): void
     {
         $this->http()->get('https://api.example.com/orders')->status();
 
-        self::assertSame('identity', $this->transport->options[0]['headers']['Accept-Encoding']);
+        self::assertSame('gzip, deflate', $this->transport->options[0]['headers']['Accept-Encoding']);
         self::assertSame(0, $this->transport->options[0]['max_redirects']);
     }
 

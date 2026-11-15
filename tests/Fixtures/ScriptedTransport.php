@@ -6,6 +6,9 @@ namespace Kinetis\RevoltHttpClient\Tests\Fixtures;
 
 use Closure;
 use RuntimeException;
+use Symfony\Component\HttpClient\Chunk\DataChunk;
+use Symfony\Component\HttpClient\Chunk\LastChunk;
+use Symfony\Component\HttpClient\Response\ResponseStream;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
 use Symfony\Contracts\HttpClient\ResponseStreamInterface;
@@ -24,7 +27,8 @@ use Symfony\Contracts\HttpClient\ResponseStreamInterface;
  * message plants the secrets a real client's would; `chunks` is the body
  * as it arrives, `headers` what precedes it, `statusDelay` how long the
  * status takes, and `statusFailure`/`readFailure` an answer that never
- * comes. A stream read always fails, as a dropped one would.
+ * comes. A body is read through `stream()`, one scripted chunk per read,
+ * the way the real transport hands it out.
  */
 final class ScriptedTransport implements HttpClientInterface
 {
@@ -35,6 +39,9 @@ final class ScriptedTransport implements HttpClientInterface
 
     /** @var list<string> the URL each attempt was sent to */
     public array $urls = [];
+
+    /** @var list<string> the method each attempt was sent with */
+    public array $methods = [];
 
     /** @var list<ScriptedResponse> the responses handed out, in order */
     public array $responses = [];
@@ -51,6 +58,7 @@ final class ScriptedTransport implements HttpClientInterface
         ++$this->requests;
         $this->options[] = $options;
         $this->urls[] = $url;
+        $this->methods[] = $method;
 
         if (($step['throw'] ?? false) === true) {
             throw new RuntimeException(
@@ -74,9 +82,17 @@ final class ScriptedTransport implements HttpClientInterface
 
     public function stream(iterable|ResponseInterface $responses, ?float $timeout = null): ResponseStreamInterface
     {
-        // Scripted answers are complete, never streamed, so a stream
-        // read fails the way a dropped one does, secrets in its message.
-        throw new RuntimeException('stream of https://SENTINELTOKEN@api.example.com/SENTINELPATH?key=SENTINELQUERY failed');
+        $response = $responses instanceof ResponseInterface ? $responses : [...$responses][0];
+
+        if (!$response instanceof ScriptedResponse) {
+            throw new RuntimeException('Only a scripted response can be streamed here.');
+        }
+
+        return new ResponseStream((static function () use ($response) {
+            $piece = $response->nextChunk();
+
+            yield $response => $piece === null ? new LastChunk() : new DataChunk(0, $piece);
+        })());
     }
 
     /**

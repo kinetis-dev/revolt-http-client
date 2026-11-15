@@ -45,8 +45,8 @@ final class Preflight
 
     /** @var array<string, string> header this client owns => why it is not a caller's to set */
     private const array OWNED_HEADERS = [
-        'accept-encoding' => 'this client asks for identity encoding, which is what makes the response-byte '
-            . 'ceiling a bound on memory',
+        'accept-encoding' => 'this client asks for gzip and deflate and decodes them itself, counting the decoded '
+            . 'bytes against the response-byte ceiling',
         'host' => 'the request URL alone names the authority a request is routed to and a credential is confined '
             . 'to; a Host of your own would send this client\'s credentials to one URL while naming a different '
             . 'server to a shared proxy in front of it',
@@ -149,6 +149,72 @@ final class Preflight
         }
 
         return $bytes;
+    }
+
+    /** Redirects followed per request: one or more. */
+    public static function redirects(int $max): int
+    {
+        if ($max < 1) {
+            throw HttpRequestException::invalidRequest('A redirect limit must be at least 1.');
+        }
+
+        return $max;
+    }
+
+    /**
+     * Where a redirect's `Location` leads from $current, resolved as RFC
+     * 3986 §5.2 resolves a reference and then held to every rule a
+     * request URL without a base URL is held to; null when it is not a
+     * URL this client would request. A fragment is dropped, as it is
+     * never sent.
+     *
+     * @return array{0: string, 1: string}|null the URL to send, and its origin
+     */
+    public static function redirectTarget(#[SensitiveParameter] string $current, #[SensitiveParameter] string $location): ?array
+    {
+        $hash = strpos($location, '#');
+        $reference = $hash === false ? $location : substr($location, 0, $hash);
+        $base = parse_url($current);
+
+        if ($reference === '' || $base === false || !isset($base['scheme'], $base['host'])) {
+            return null;
+        }
+
+        if (preg_match('/^[A-Za-z][A-Za-z0-9+.-]*:/', $reference) !== 1) {
+            $authority = $base['scheme'] . '://' . $base['host'] . (isset($base['port']) ? ':' . $base['port'] : '');
+
+            if (str_starts_with($reference, '//')) {
+                $reference = $base['scheme'] . ':' . $reference;
+            } else {
+                $questionMark = strpos($reference, '?');
+                $path = $questionMark === false ? $reference : substr($reference, 0, $questionMark);
+                $query = $questionMark === false ? '' : substr($reference, $questionMark);
+                $basePath = $base['path'] ?? '/';
+
+                if ($path === '') {
+                    $path = $basePath;
+                } elseif (!str_starts_with($path, '/')) {
+                    $path = substr($basePath, 0, (int) strrpos($basePath, '/') + 1) . $path;
+                }
+
+                $reference = $authority . $path . $query;
+            }
+        }
+
+        $parts = parse_url($reference);
+
+        if ($parts === false || !isset($parts['scheme'], $parts['host']) || isset($parts['user']) || isset($parts['pass'])) {
+            return null;
+        }
+
+        $resolved = $parts['scheme'] . '://' . $parts['host'] . (isset($parts['port']) ? ':' . $parts['port'] : '')
+            . self::removeDotSegments($parts['path'] ?? '') . (isset($parts['query']) ? '?' . $parts['query'] : '');
+
+        try {
+            return self::target(null, $resolved);
+        } catch (HttpRequestException) {
+            return null;
+        }
     }
 
     /** Retries beyond the first attempt: zero or more, and bounded. */
@@ -346,6 +412,33 @@ final class Preflight
         }
 
         return $path;
+    }
+
+    /** RFC 3986 §5.2.4, literally: "." and ".." segments resolved away. */
+    private static function removeDotSegments(#[SensitiveParameter] string $path): string
+    {
+        $output = '';
+
+        while ($path !== '') {
+            if (str_starts_with($path, '../')) {
+                $path = substr($path, 3);
+            } elseif (str_starts_with($path, './') || str_starts_with($path, '/./')) {
+                $path = substr($path, 2);
+            } elseif ($path === '/.') {
+                $path = '/';
+            } elseif (str_starts_with($path, '/../') || $path === '/..') {
+                $path = '/' . substr($path, 4);
+                $output = substr($output, 0, (int) strrpos($output, '/'));
+            } elseif ($path === '.' || $path === '..') {
+                $path = '';
+            } else {
+                $slash = strpos($path, '/', 1);
+                $output .= $slash === false ? $path : substr($path, 0, $slash);
+                $path = $slash === false ? '' : substr($path, $slash);
+            }
+        }
+
+        return $output;
     }
 
     private static function headerName(#[SensitiveParameter] string $name): string

@@ -19,7 +19,11 @@ enum HttpFailure: string
      */
     case InvalidRequest = 'invalid-request';
 
-    /** Reading a response as JSON failed. */
+    /**
+     * The body could not be read as what it claims to be: not valid
+     * JSON, a content encoding this client does not decode, or gzip or
+     * deflate data that is corrupt or truncated.
+     */
     case Conversion = 'conversion';
 
     /**

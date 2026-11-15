@@ -13,7 +13,8 @@
         "symfony/http-client": "^8.1.11",
         "symfony/http-client-contracts": "^3.7.1",
         "amphp/http-client": "^5.3.6",
-        "revolt/event-loop": "^1.0.9"
+        "revolt/event-loop": "^1.0.9",
+        "ext-zlib": "*"
     },
     "require-dev": {
         "infection/infection": "^0.35.0",

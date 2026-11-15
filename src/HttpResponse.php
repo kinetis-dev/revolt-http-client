@@ -14,12 +14,15 @@ use SensitiveParameter;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
 use Throwable;
+use UnexpectedValueException;
 
 /**
  * What {@see Http}'s verb methods return. An error status is an answer
  * here, not an exception; {@see throw()} opts into the other behavior.
  * Reading is deferred until something asks for the body, status, or
- * headers, which is what lets requests started inside
+ * headers, except that a client with retries, redirects or a cookie jar
+ * waits for the status itself; either way the calling Fiber suspends,
+ * which is what lets requests started inside
  * `Kinetis\Async\concurrently()` overlap.
  *
  * This object owns the underlying transport response for as long as it
@@ -99,7 +102,11 @@ final class HttpResponse
         return !$this->successful();
     }
 
-    /** Any 3xx — a redirect this client did not follow. */
+    /**
+     * Any 3xx: a redirect this client did not follow. Without
+     * {@see Http::withRedirects()} none is followed; with it, this is one
+     * the rules there refused, or the one past its limit.
+     */
     public function redirect(): bool
     {
         $status = $this->status();
@@ -122,12 +129,16 @@ final class HttpResponse
     }
 
     /**
-     * The raw body, read once and kept, bounded by the ceiling
-     * {@see Http::withMaxResponseBytes()} sets at all three points a body
-     * can pass it — a `Content-Length` past it, the transfer itself, and
-     * the bytes that arrived — so no path ends with the whole of an
-     * untrusted reply in memory. A body {@see chunks()} handed out is not
-     * buffered, so reading it here fails with the `Consumed` category.
+     * The body, read once and kept, decoded from gzip or deflate when its
+     * `Content-Encoding` says so. The ceiling
+     * {@see Http::withMaxResponseBytes()} sets bounds it at every point a
+     * body can pass it — a `Content-Length` past it, the bytes on the
+     * wire, and the decoded bytes as they are produced — so no path ends
+     * with the whole of an untrusted reply in memory. An encoding this
+     * client does not decode, and compressed data that is corrupt or
+     * truncated, fail with the `Conversion` category. A body
+     * {@see chunks()} handed out is not buffered, so reading it here fails
+     * with the `Consumed` category.
      */
     public function body(): string
     {
@@ -143,31 +154,25 @@ final class HttpResponse
 
         $this->guardDeclaredLength();
 
-        // getContent(false) suppresses the transport's own
-        // throw-on-error-status, leaving that decision here.
-        $body = $this->read(fn (): string => $this->response->getContent(false));
+        $body = '';
 
-        if (strlen($body) > $this->budget->maxBytes) {
-            throw $this->tooLarge();
+        foreach ($this->decodedPieces() as $piece) {
+            $body .= $piece;
         }
-
-        // A body read to its end leaves the transport nothing to
-        // release, so neither discard() nor the destructor cancels a
-        // response that is already complete.
-        $this->released = true;
 
         return $this->body = $body;
     }
 
     /**
-     * The body as it arrives, one non-empty piece per read of the
-     * transport, for a reply too long or too incremental to buffer. The
-     * calling Fiber suspends between pieces, so the loop keeps running.
+     * The body as it arrives, decoded as {@see body()} decodes it, one
+     * non-empty piece at a time, for a reply too long or too incremental
+     * to buffer. The calling Fiber suspends between reads, so the loop
+     * keeps running.
      *
      * The operation's budget covers the whole stream: the deadline is
      * the one every other read shares, and the byte ceiling counts every
-     * piece, so a piece that would carry the total past it is never
-     * handed over. A `Content-Length` past the ceiling is refused here,
+     * decoded piece, so a piece that would carry the total past it is
+     * never handed over. A `Content-Length` past the ceiling is refused here,
      * before anything is read. Leaving the loop early — `break`, an
      * exception, or dropping the generator — releases the transport
      * response. The body is read once: after this, {@see body()},
@@ -190,7 +195,7 @@ final class HttpResponse
 
         $this->streamed = true;
 
-        return $this->stream();
+        return $this->decodedPieces();
     }
 
     /**
@@ -281,24 +286,53 @@ final class HttpResponse
         $this->releaseOnce();
     }
 
-    /** @return Generator<int, string> */
-    private function stream(): Generator
+    /**
+     * The one read loop behind {@see body()} and {@see chunks()}: wire
+     * pieces in, decoded pieces out, each counted against the ceiling
+     * before it is handed over. The decoder is chosen at the first byte,
+     * so an empty body, a HEAD answer's included, needs none.
+     *
+     * @return Generator<int, string>
+     */
+    private function decodedPieces(): Generator
     {
         $received = 0;
         $ended = false;
+        $decoder = null;
+        $decoding = false;
 
         try {
             while (($piece = $this->read($this->nextPiece(...))) !== null) {
-                $received += strlen($piece);
+                if (!$decoding) {
+                    $decoder = $this->decoderFor();
+                    $decoding = true;
+                }
 
-                // The Amp transport runs the progress guard only when it is
-                // read, after bytes it had already queued, so the count
-                // that keeps them from the caller is this one.
+                $decoded = $decoder === null ? [$piece] : $this->slices($decoder->push($piece));
+
+                foreach ($decoded as $output) {
+                    // The Amp transport runs the progress guard only when it
+                    // is read, after bytes it had already queued, and that
+                    // guard counts wire bytes; the count that keeps decoded
+                    // bytes from the caller is this one.
+                    $received += strlen($output);
+
+                    if ($received > $this->budget->maxBytes) {
+                        throw $this->tooLarge();
+                    }
+
+                    yield $output;
+                }
+            }
+
+            foreach ($decoder === null ? [] : $this->slices($decoder->finish()) as $output) {
+                $received += strlen($output);
+
                 if ($received > $this->budget->maxBytes) {
                     throw $this->tooLarge();
                 }
 
-                yield $piece;
+                yield $output;
             }
 
             $ended = true;
@@ -426,6 +460,43 @@ final class HttpResponse
         // resumed, so exactly one of $error/$result is set by now.
         /** @var T $result */
         return $result;
+    }
+
+    /**
+     * The decoder the response's Content-Encoding names, or null when it
+     * names none; an encoding the client does not decode is the
+     * `Conversion` failure its fixed text names.
+     */
+    private function decoderFor(): ?ContentDecoder
+    {
+        try {
+            return ContentDecoder::for($this->headers()['content-encoding'] ?? []);
+        } catch (UnexpectedValueException $failure) {
+            $this->releaseOnce();
+
+            throw $this->conversionFailed($failure->getMessage());
+        }
+    }
+
+    /**
+     * Drains a decoder's output one slice at a time while the caller
+     * counts, so the decoded bytes in memory never run more than one
+     * slice past the ceiling. The decoder's generators run only as this
+     * one is pulled, so a corrupt or truncated stream fails here, as the
+     * `Conversion` failure its fixed text names.
+     *
+     * @param Generator<int, string> $slices
+     * @return Generator<int, string>
+     */
+    private function slices(Generator $slices): Generator
+    {
+        try {
+            yield from $slices;
+        } catch (UnexpectedValueException $failure) {
+            $this->releaseOnce();
+
+            throw $this->conversionFailed($failure->getMessage());
+        }
     }
 
     /** $problem is fixed text; the body it describes is never quoted. */

@@ -305,24 +305,38 @@ final class HttpTest extends TestCase
         }
     }
 
-    public function test_every_request_asks_the_server_for_identity_encoding(): void
+    public function test_every_request_asks_the_server_for_gzip_and_deflate(): void
     {
-        self::assertSame('identity', $this->http()->get('/me')->jsonPath('headers.accept-encoding'));
+        self::assertSame('gzip, deflate', $this->http()->get('/me')->jsonPath('headers.accept-encoding'));
+    }
+
+    public function test_a_gzip_and_a_deflate_body_arrive_decoded_with_their_headers_as_received(): void
+    {
+        $gzip = $this->http()->get('/gzip/65536');
+
+        self::assertSame(str_repeat('A', 65536), $gzip->body());
+        self::assertSame('gzip', $gzip->header('Content-Encoding'));
+        self::assertSame(str_repeat('A', 65536), implode('', iterator_to_array($this->http()->get('/deflate/65536')->chunks(), false)));
     }
 
     /**
-     * A gzipped body is bounded by its wire size, since identity
-     * encoding is what keeps the counted bytes and the held bytes the
-     * same bytes. 64 KiB of one repeated character compresses to a
-     * couple of hundred, so a ceiling between the two proves which one
-     * is measured.
+     * The ceiling counts decoded bytes: 64 KiB of one repeated character
+     * compresses to a couple of hundred, so a ceiling between the two
+     * proves which one is measured, read whole and streamed.
      */
-    public function test_a_compressed_body_is_bounded_by_its_wire_size(): void
+    public function test_a_compressed_body_is_bounded_by_its_decoded_size(): void
     {
-        $body = $this->http()->withMaxResponseBytes(4096)->get('/gzip/65536')->body();
-
-        self::assertLessThanOrEqual(4096, strlen($body));
-        self::assertSame(65536, strlen((string) gzdecode($body)));
+        foreach ([
+            'body' => static fn ($response) => $response->body(),
+            'chunks' => static fn ($response) => iterator_to_array($response->chunks(), false),
+        ] as $read => $call) {
+            try {
+                $call($this->http()->withMaxResponseBytes(4096)->get('/gzip/65536'));
+                self::fail("A body decoding past the ceiling was expected to raise through {$read}.");
+            } catch (HttpRequestException $e) {
+                self::assertSame(HttpFailure::ResponseTooLarge, $e->category, $read);
+            }
+        }
     }
 
     public function test_a_request_suspends_rather_than_blocking_the_process(): void

@@ -29,7 +29,8 @@ use Throwable;
  * With no argument it uses {@see AmpHttpClientFactory}'s transport and
  * autowires with nothing to register; under a persistent worker register
  * a configured instance instead, so one connection pool outlives the
- * request. Every `with*` method returns a new instance.
+ * request. Every `with*` method returns a new instance; a
+ * {@see CookieJar} given to one is the only state clients share.
  *
  * {@link https://kinetis.dev/docs/revolt-http-client.html} states what
  * this client guarantees. An injected transport is the caller's to hold
@@ -64,13 +65,21 @@ final class Http
     private const array CREDENTIAL_HEADERS = ['authorization', 'cookie'];
 
     /**
-     * Asked for on every request and not a caller's to change: the byte
-     * ceiling counts what arrives, which bounds memory only while
-     * nothing inflates the body in between.
-     * {@link https://kinetis.dev/docs/revolt-http-client.html} states what
-     * that trades away.
+     * Asked for on every request and not a caller's to change. Sending it
+     * keeps the transport from inflating the body itself, without a
+     * bound; {@see HttpResponse} inflates instead, counting the decoded
+     * bytes against the byte ceiling.
      */
-    private const array IDENTITY_ENCODING = ['name' => 'Accept-Encoding', 'values' => ['identity']];
+    private const array ACCEPTED_ENCODINGS = ['name' => 'Accept-Encoding', 'values' => ['gzip, deflate']];
+
+    /** Redirects followed as a GET without a body, per RFC 9110 §15.4. */
+    private const array METHOD_CHANGING_REDIRECTS = [301, 302, 303];
+
+    /** Redirects that repeat the request as it was. */
+    private const array METHOD_KEEPING_REDIRECTS = [307, 308];
+
+    /** Headers that describe a body, dropped with the body a GET redirect sheds. */
+    private const array BODY_HEADERS = ['content-type', 'content-length', 'content-encoding'];
 
     /** Bounds an operation that never got one from the caller. */
     public const float DEFAULT_TIMEOUT_SECONDS = 30.0;
@@ -99,6 +108,14 @@ final class Http
     private bool $sendAsForm = false;
 
     private ?RequestPacer $pacer = null;
+
+    /** Redirects followed per request; null follows none. */
+    private ?int $maxRedirects = null;
+
+    /** @var (Closure(string): bool)|null asked before every redirect is followed */
+    private ?Closure $allowRedirect = null;
+
+    private ?CookieJar $cookieJar = null;
 
     private readonly HttpClientInterface $transport;
 
@@ -231,6 +248,46 @@ final class Http
         return $clone;
     }
 
+    /**
+     * Follows up to $max redirects per request, inside the one deadline,
+     * byte ceiling, attempt count and pacer slot of the request that
+     * started them. 301, 302 and 303 are followed as a GET without a
+     * body (a HEAD stays a HEAD); 307 and 308 repeat the request only
+     * when its method is idempotent and its body can be sent again.
+     *
+     * A redirect is returned unfollowed when its `Location` is missing or
+     * invalid, when it leaves https for http, when a client with a base
+     * URL is sent outside that base URL, when $allow, given each target
+     * URL before it is requested, answers anything but true, and when it
+     * is the one past $max.
+     *
+     * @param (Closure(string): bool)|null $allow
+     */
+    public function withRedirects(int $max = 5, ?Closure $allow = null): self
+    {
+        $clone = clone $this;
+        $clone->maxRedirects = Preflight::redirects($max);
+        $clone->allowRedirect = $allow;
+
+        return $clone;
+    }
+
+    /**
+     * Keeps the cookies every response sets in $jar, redirect hops
+     * included, and sends the matching ones on every request. $jar is the
+     * one object clients share on purpose: give each session its own.
+     * Cookies a caller sets in a `Cookie` header still need a base URL;
+     * the jar's own are scoped to the host that set them, so a client
+     * without a base URL may carry a jar.
+     */
+    public function withCookieJar(CookieJar $jar): self
+    {
+        $clone = clone $this;
+        $clone->cookieJar = $jar;
+
+        return $clone;
+    }
+
     /** Sends array bodies as `application/x-www-form-urlencoded` rather than JSON. */
     public function asForm(): self
     {
@@ -299,29 +356,20 @@ final class Http
 
         [$target, $origin] = Preflight::target($this->base, $url);
 
-        $headers['accept-encoding'] = self::IDENTITY_ENCODING;
-
-        $transportOptions = ['headers' => self::flattenHeaders($headers), 'max_redirects' => 0];
-
         $query = isset($options['query']) ? [...$this->query, ...$options['query']] : $this->query;
-
-        if ($query !== []) {
-            $transportOptions['query'] = $query;
-        }
 
         $retries = in_array($method, self::IDEMPOTENT_METHODS, true) ? $this->retries : 0;
 
+        $body = [];
+
         if (array_key_exists('json', $options)) {
-            $transportOptions['json'] = $options['json'];
+            $body['json'] = $options['json'];
         } elseif (array_key_exists('body', $options)) {
-            $transportOptions['body'] = self::replayableBody($options['body'], $retries);
+            $body['body'] = self::replayableBody($options['body'], $retries);
         }
 
         return $this->dispatch(
-            $method,
-            $target,
-            $origin,
-            $transportOptions,
+            new Hop($method, $target, $origin, $headers, $query, $body),
             $options['timeout'] ?? $this->timeout,
             $retries,
         );
@@ -347,22 +395,19 @@ final class Http
 
     /**
      * One attempt, then as many more as $retries allows — `withRetries()`
-     * for an idempotent method, none for any other — all inside a single
-     * deadline: each attempt gets only what is left of it, and the
-     * {@see ResponseBudget} handed to the surviving response carries the
-     * same deadline into every read of it.
-     *
-     * @param array<string, mixed> $options
+     * for an idempotent method, none for any other — and every redirect
+     * `withRedirects()` follows, all inside a single deadline: each
+     * attempt gets only what is left of it, and the {@see ResponseBudget}
+     * handed to the surviving response carries the same deadline into
+     * every read of it. A redirect hop is a wire attempt like a retry and
+     * draws on the same count; only the request that started the chain
+     * waits for the pacer's slot.
      */
-    private function dispatch(
-        string $method,
-        #[SensitiveParameter] string $target,
-        string $origin,
-        #[SensitiveParameter] array $options,
-        float $timeout,
-        int $retries,
-    ): HttpResponse {
-        $budget = new ResponseBudget($method, $origin, $timeout, $this->maxResponseBytes);
+    private function dispatch(#[SensitiveParameter] Hop $hop, float $timeout, int $retries): HttpResponse
+    {
+        $budget = new ResponseBudget($hop->method, $hop->origin, $timeout, $this->maxResponseBytes);
+        $origin = $hop->origin;
+        $redirects = 0;
 
         if ($this->pacer !== null) {
             $slot = self::reserveSlot($this->pacer, $origin, $budget);
@@ -383,12 +428,12 @@ final class Http
 
             ++$budget->attempts;
             $response = new HttpResponse(
-                $this->issue($method, $target, $budget->applyTo($options)),
+                $this->issue($hop->method, $hop->target, $budget->applyTo($this->transportOptions($hop))),
                 $budget,
                 $this->transport,
             );
 
-            if ($retries === 0) {
+            if ($retries === 0 && $this->maxRedirects === null && $this->cookieJar === null) {
                 // Nothing left to decide, so the response stays deferred
                 // and every read of it happens where the caller asked.
                 return $response;
@@ -408,8 +453,22 @@ final class Http
                 $status = null;
             }
 
+            if ($status !== null) {
+                $this->cookieJar?->store($hop->target, $response->headers()['set-cookie'] ?? []);
+            }
+
             if ($status !== null && !in_array($status, $this->retryStatuses, true)) {
-                return $response;
+                $next = $redirects < ($this->maxRedirects ?? 0) ? $this->redirectFrom($hop, $status, $response) : null;
+
+                if ($next === null) {
+                    return $response;
+                }
+
+                $response->discard();
+                $hop = $next;
+                ++$redirects;
+
+                continue;
             }
 
             $wait = self::FIRST_BACKOFF_SECONDS * 2 ** ($budget->attempts - 1);
@@ -445,6 +504,115 @@ final class Http
             $response->discard();
             self::pause($wait);
         }
+    }
+
+    /**
+     * The request a redirect answer leads to, or null when this client
+     * returns the answer instead; {@see withRedirects()} states the rules.
+     */
+    private function redirectFrom(#[SensitiveParameter] Hop $hop, int $status, HttpResponse $response): ?Hop
+    {
+        $keepsMethod = in_array($status, self::METHOD_KEEPING_REDIRECTS, true);
+
+        if (!$keepsMethod && !in_array($status, self::METHOD_CHANGING_REDIRECTS, true)) {
+            return null;
+        }
+
+        // A 307 or 308 sends the same request again, which only an
+        // idempotent method with a body that still exists can afford.
+        if ($keepsMethod && (!in_array($hop->method, self::IDEMPOTENT_METHODS, true) || !self::isReplayable($hop->body))) {
+            return null;
+        }
+
+        $location = $response->header('Location');
+        $next = $location === null ? null : Preflight::redirectTarget($hop->target, $location);
+
+        if ($next === null) {
+            return null;
+        }
+
+        [$target, $origin] = $next;
+
+        if (str_starts_with($hop->origin, 'https:') && !str_starts_with($origin, 'https:')) {
+            return null;
+        }
+
+        // A base URL is what confines this client's credentials, so a
+        // redirect never takes them outside it.
+        if ($this->base !== null && !str_starts_with($target, $this->base[1])) {
+            return null;
+        }
+
+        if ($this->allowRedirect !== null) {
+            try {
+                $allowed = ($this->allowRedirect)($target) === true;
+            } catch (Throwable $failure) {
+                $response->discard();
+
+                throw $failure;
+            }
+
+            if (!$allowed) {
+                return null;
+            }
+        }
+
+        if ($keepsMethod) {
+            return new Hop($hop->method, $target, $origin, $hop->headers, [], $hop->body);
+        }
+
+        return new Hop(
+            $hop->method === 'HEAD' ? 'HEAD' : 'GET',
+            $target,
+            $origin,
+            array_diff_key($hop->headers, array_flip(self::BODY_HEADERS)),
+            [],
+            [],
+        );
+    }
+
+    /**
+     * The transport options for one wire attempt of $hop: its headers,
+     * the accepted encodings, the jar's cookies for its URL after any the
+     * caller set in a `Cookie` header, its query and its body. The
+     * transport follows no redirect itself.
+     *
+     * @return array<string, mixed>
+     */
+    private function transportOptions(#[SensitiveParameter] Hop $hop): array
+    {
+        $headers = $hop->headers;
+        $headers['accept-encoding'] = self::ACCEPTED_ENCODINGS;
+        $jarCookies = $this->cookieJar?->header($hop->target);
+
+        if ($jarCookies !== null) {
+            $headers['cookie'] = [
+                'name' => $headers['cookie']['name'] ?? 'Cookie',
+                'values' => [implode('; ', [...($headers['cookie']['values'] ?? []), $jarCookies])],
+            ];
+        }
+
+        $options = ['headers' => self::flattenHeaders($headers), 'max_redirects' => 0, ...$hop->body];
+
+        if ($hop->query !== []) {
+            $options['query'] = $hop->query;
+        }
+
+        return $options;
+    }
+
+    /**
+     * Whether a body can be sent a second time: none, a string, an array
+     * or a JSON value can; a stream resource or a Closure is consumed by
+     * the first send.
+     *
+     * @param array<string, mixed> $body
+     */
+    private static function isReplayable(#[SensitiveParameter] array $body): bool
+    {
+        $value = $body['body'] ?? null;
+
+        return !is_resource($value) && !$value instanceof Closure;
     }
 
     /**

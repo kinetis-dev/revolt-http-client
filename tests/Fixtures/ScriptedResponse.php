@@ -21,6 +21,8 @@ final class ScriptedResponse implements ResponseInterface
     /** How many chunks the transfer got through before it was stopped. */
     public int $chunksDelivered = 0;
 
+    private int $delivered = 0;
+
     /**
      * @param array<string, list<string>> $headers
      * @param list<string> $chunks
@@ -66,6 +68,32 @@ final class ScriptedResponse implements ResponseInterface
     public function getHeaders(bool $throw = true): array
     {
         return $this->headers;
+    }
+
+    /**
+     * The next chunk of the body, reporting the bytes delivered so far to
+     * the progress hook, or null once the body has ended. A `readFailure`
+     * raises here, its message carrying whatever the script planted.
+     */
+    public function nextChunk(): ?string
+    {
+        if ($this->readFailure !== null) {
+            throw new RuntimeException($this->readFailure);
+        }
+
+        if ($this->chunksDelivered >= count($this->chunks)) {
+            return null;
+        }
+
+        $chunk = $this->chunks[$this->chunksDelivered];
+        $this->delivered += strlen($chunk);
+        ++$this->chunksDelivered;
+
+        if ($this->onProgress !== null) {
+            ($this->onProgress)($this->delivered);
+        }
+
+        return $chunk;
     }
 
     public function getContent(bool $throw = true): string

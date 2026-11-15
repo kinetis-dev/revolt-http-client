@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Kinetis\RevoltHttpClient\Tests;
 
 use Closure;
+use Kinetis\RevoltHttpClient\CookieJar;
 use Kinetis\RevoltHttpClient\Exception\HttpRequestException;
 use Kinetis\RevoltHttpClient\Http;
 use Kinetis\RevoltHttpClient\Tests\Fixtures\ScriptedTransport;
@@ -62,7 +63,10 @@ final class TraceSecrecyTest extends TestCase
         }];
 
         yield 'a streamed read that fails on the wire' => [static function () {
-            $response = new Http(new ScriptedTransport([['status' => 200]]))
+            $response = new Http(new ScriptedTransport([[
+                'status' => 200,
+                'readFailure' => 'stream of https://SENTINELTOKEN@api.example.com/SENTINELPATH?key=SENTINELQUERY failed',
+            ]]))
                 ->withBaseUrl('https://api.example.com')
                 ->withToken(self::TOKEN)
                 ->get('/' . self::PATH . '?q=' . self::QUERY);
@@ -73,6 +77,25 @@ final class TraceSecrecyTest extends TestCase
 
             return null;
         }];
+
+        yield 'a request carrying a jar cookie that the transport refuses' => [static function () {
+            $transport = new ScriptedTransport([
+                ['status' => 200, 'headers' => ['set-cookie' => ['sid=SENTINELCOOKIE; Path=/']]],
+                ['throw' => true],
+            ]);
+            $http = new Http($transport)->withCookieJar(new CookieJar());
+            $http->get('https://api.example.com/login')->status();
+
+            return $http->get('https://api.example.com/' . self::PATH);
+        }];
+
+        yield 'a redirect hop that fails after another set a cookie' => [static fn () => new Http(new ScriptedTransport([
+            ['status' => 302, 'headers' => ['location' => ['/next'], 'set-cookie' => ['sid=SENTINELCOOKIE']]],
+            ['status' => 200, 'statusFailure' => 'read of https://SENTINELTOKEN@api.example.com failed'],
+        ]))
+            ->withCookieJar(new CookieJar())
+            ->withRedirects()
+            ->get('https://api.example.com/start')];
 
         yield 'an error status raised on' => [static fn () => new Http(new ScriptedTransport([['status' => 500]]))
             ->withBaseUrl('https://api.example.com')

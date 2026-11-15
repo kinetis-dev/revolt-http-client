@@ -45,15 +45,22 @@ blocking the whole process — so several run at once through
 
 - **A credential is pinned to one origin.** A client carrying an
   `Authorization` or `Cookie` header requires `withBaseUrl()`, and then
-  every URL it accepts is relative to that base. Another origin is
-  another client. The validated URL alone names where a request goes:
-  `Host`, `Proxy-Authorization`, and `Accept-Encoding` are refused
-  wherever a caller writes them.
-- **Redirects are never followed.** A 3xx is a terminal response with a
-  `Location` to read. Following one means deciding, per response,
-  whether a new origin may see this client's `Authorization` header,
-  cookies, and body — a decision belonging to the caller who knows what
-  the credential is for.
+  every URL it accepts, and every redirect it follows, is under that
+  base. Another origin is another client. The validated URL alone names
+  where a request goes: `Host`, `Proxy-Authorization`, and
+  `Accept-Encoding` are refused wherever a caller writes them.
+- **Redirects are followed only when asked.** By default a 3xx is the
+  response, with a `Location` to read. `withRedirects()` follows a
+  bounded number inside the request's one deadline and byte ceiling:
+  301, 302 and 303 as a `GET` without the body, 307 and 308 only for an
+  idempotent method whose body can be sent again, never from https to
+  http, never outside a client's base URL, and only where an optional
+  callback allows each target. A redirect it does not follow is returned
+  as the response.
+- **Cookies live in a jar you hand it.** `withCookieJar()` keeps the
+  cookies of one session in a `CookieJar` and sends them back, each to
+  the exact host that set it, whatever its `Domain` says. No client has a
+  jar until it is given one; build one per session, never per worker.
 - **One retry layer, for idempotent methods only, and one total
   deadline.** `withRetries()` is the only way to configure retries, the
   transport underneath makes one wire attempt per request, and a
@@ -73,8 +80,11 @@ blocking the whole process — so several run at once through
   states its rules.
 - **A bounded response.** `withMaxResponseBytes()` is the ceiling a body
   may reach, enforced while it arrives rather than once it is already in
-  memory. Every request asks for identity encoding, so the bytes counted
-  are the bytes held rather than the bytes off the wire.
+  memory. Every request asks for gzip and deflate, and this client
+  decodes them itself, counting the decoded bytes against the ceiling as
+  they are produced, so a small compressed reply cannot inflate past it.
+  Another content encoding, and compressed data that is corrupt or
+  truncated, fail rather than pass through.
 - **Failures carry no secrets.** `HttpRequestException` — the one
   exception type this package throws — carries the request method, the
   origin, a status, and a category from a fixed list. No path, no query
@@ -86,7 +96,8 @@ An error status is not one of those failures: `successful()`, `failed()`,
 on, and `throw()` opts into raising instead. Read the body with `json()`,
 `jsonPath('customer.email')`, or `body()`, or stream it as it arrives
 with `chunks()`, under the same deadline and byte ceiling. `attempts()`
-reports how many wire attempts the call sent, retries included.
+reports how many wire attempts the call sent, retries and followed
+redirects included.
 
 `AmpHttpClientFactory::create()` returns the underlying Symfony
 `HttpClientInterface` on its own, for libraries that want to be handed a

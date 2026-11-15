@@ -19,7 +19,8 @@ declare(strict_types=1);
  * arrives rather than believe a header. `/gzip/{n}` answers with n
  * highly compressible bytes gzipped, whatever the request asked to
  * accept, which is the shape where bytes on the wire and bytes in
- * memory come apart.
+ * memory come apart. `/deflate/{n}` is the same body zlib-wrapped, as
+ * the deflate content coding is.
  */
 
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
@@ -60,6 +61,17 @@ if (preg_match('#^/gzip/(\d+)$#', $path, $matches) === 1) {
 
     header('Content-Type: text/plain');
     header('Content-Encoding: gzip');
+    header('Content-Length: ' . strlen($compressed));
+    echo $compressed;
+
+    return;
+}
+
+if (preg_match('#^/deflate/(\d+)$#', $path, $matches) === 1) {
+    $compressed = gzcompress(str_repeat('A', (int) $matches[1]), 9);
+
+    header('Content-Type: text/plain');
+    header('Content-Encoding: deflate');
     header('Content-Length: ' . strlen($compressed));
     echo $compressed;
 

@@ -15,8 +15,9 @@ use PHPUnit\Framework\TestCase;
 /**
  * A credential reaches the one origin its base URL names, and no other.
  * The base URL is the whole mechanism: with one set every target is
- * relative to it, a 3xx is never followed, and the validated URL alone
- * decides where the request is routed.
+ * relative to it, a redirect is followed only to a target under the
+ * base URL, and the validated URL alone decides where the request is
+ * routed.
  */
 final class HttpCredentialOriginTest extends TestCase
 {
