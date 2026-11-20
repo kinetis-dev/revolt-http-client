@@ -22,8 +22,7 @@ use UnexpectedValueException;
  * Reading is deferred until something asks for the body, status, or
  * headers, except that a client with retries, redirects or a cookie jar
  * waits for the status itself; either way the calling Fiber suspends,
- * which is what lets requests started inside
- * `Kinetis\Async\concurrently()` overlap.
+ * which is what lets requests started in separate Fibers overlap.
  *
  * This object owns the underlying transport response for as long as it
  * lives, and releases it on {@see discard()}, on a full read, on a

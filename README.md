@@ -38,8 +38,21 @@ $api->post('/orders', ['sku' => 'A1', 'quantity' => 2]);
 
 A request made through this client suspends the calling Fiber and yields
 back to Revolt's event loop while waiting on the network, instead of
-blocking the whole process — so several run at once through
-`Kinetis\Async\concurrently()` with no pooling API of its own.
+blocking the whole process. Requests started in separate Fibers overlap,
+with no pooling API of its own; `amphp/amp`, installed with
+`amphp/http-client`, starts and joins them:
+
+```php
+use function Amp\async;
+use function Amp\Future\await;
+
+[$orders, $invoices] = await([
+    async(fn () => $api->get('/orders')->json()),
+    async(fn () => $api->get('/invoices')->json()),
+]);
+```
+
+In a Kinetis application, `Kinetis\Async\concurrently()` does the same.
 
 ## What it guarantees
 
